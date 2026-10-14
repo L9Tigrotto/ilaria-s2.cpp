@@ -971,6 +971,19 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
         x = ggml_mul(ctx0, x, ggml_repeat(ctx0, token_scale, x));
     }
 
+    const int32_t n_kv = std::min(max_seq_len_, GGML_PAD(n_past_ + 1, 256));
+    ggml_tensor * kv_idx  = nullptr;
+    ggml_tensor * kq_mask = nullptr;
+    std::vector<ggml_fp16_t> kq_mask_vals;
+    if (n_tokens == 1) {
+        kv_idx  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+        kq_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_kv, 1);
+        kq_mask_vals.resize(n_kv);
+        for (int32_t j = 0; j < n_kv; ++j) {
+            kq_mask_vals[j] = ggml_fp32_to_fp16(j <= n_past_ ? 0.0f : -INFINITY);
+        }
+    }
+
     for (int32_t il = 0; il < hparams_.block_count; ++il) {
         const auto & layer = weights_.layers[il];
 
@@ -1000,6 +1013,36 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
 
         const size_t layer_off_k = static_cast<size_t>(il) * memory_k_->nb[3];
         const size_t layer_off_v = static_cast<size_t>(il) * memory_v_->nb[3];
+        // one token (every frame after the prefill): fused attention straight over the F16 cache,
+        // which already holds this token. The general path below casts, concatenates and repeats the whole
+        // history per layer and per frame, about 15 kernels more per layer.
+        // The graph has the same shapes and offsets from frame to frame, so the CUDA backend can replay it
+        // as one CUDA graph: the token goes in by row index, and the attention spans n_kv rows (a multiple
+        // of 256) with a mask over the ones not written yet.
+        if (n_tokens == 1) {
+            ggml_tensor * k_set = ggml_set_rows(ctx0,
+                ggml_view_2d(ctx0, memory_k_, kv_size, max_seq_len_, memory_k_->nb[2], layer_off_k),
+                ggml_reshape_2d(ctx0, k, kv_size, 1), kv_idx);
+            ggml_tensor * v_set = ggml_set_rows(ctx0,
+                ggml_view_2d(ctx0, memory_v_, kv_size, max_seq_len_, memory_v_->nb[2], layer_off_v),
+                ggml_reshape_2d(ctx0, v, kv_size, 1), kv_idx);
+            ggml_tensor * k_all = ggml_view_3d(ctx0, k_set, head_dim, n_kv, n_head_kv,
+                memory_k_->nb[2], memory_k_->nb[1], 0);
+            ggml_tensor * v_all = ggml_view_3d(ctx0, v_set, head_dim, n_kv, n_head_kv,
+                memory_v_->nb[2], memory_v_->nb[1], 0);
+            ggml_tensor * fa = ggml_flash_attn_ext(ctx0, ggml_permute(ctx0, q, 0, 2, 1, 3), k_all, v_all,
+                kq_mask, attn_scale, 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+            ggml_tensor * attn_out = mul_mat_checked(ctx0, layer.wo, ggml_reshape_2d(ctx0, fa, q_size, n_tokens), "mul_mat:wo");
+            ggml_tensor * h     = ggml_add(ctx0, x, attn_out);
+            ggml_tensor * ff_in = rms_norm_weighted(ctx0, h, layer.ffn_norm, hparams_.rms_norm_eps);
+            ggml_tensor * gate  = mul_mat_checked(ctx0, layer.w1, ff_in, "mul_mat:w1");
+            ggml_tensor * up    = mul_mat_checked(ctx0, layer.w3, ff_in, "mul_mat:w3");
+            ggml_tensor * ff_out = mul_mat_checked(ctx0, layer.w2, ggml_swiglu_split(ctx0, gate, up), "mul_mat:w2");
+            x = ggml_add(ctx0, h, ff_out);
+            continue;
+        }
+
         const size_t token_off_k = static_cast<size_t>(n_past_) * memory_k_->nb[2];
         const size_t token_off_v = static_cast<size_t>(n_past_) * memory_v_->nb[2];
 
@@ -1013,28 +1056,6 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
             layer_off_v + token_off_v);
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, k, k_slot));
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, v, v_slot));
-
-        // one token (every frame after the prefill): fused attention straight over the F16 cache,
-        // which already holds this token. The general path below casts, concatenates and repeats the whole
-        // history per layer and per frame, about 15 kernels more per layer.
-        if (n_tokens == 1) {
-            const int32_t n_kv = n_past_ + 1;
-            ggml_tensor * k_all = ggml_view_3d(ctx0, memory_k_, head_dim, n_kv, n_head_kv,
-                memory_k_->nb[2], memory_k_->nb[1], layer_off_k);
-            ggml_tensor * v_all = ggml_view_3d(ctx0, memory_v_, head_dim, n_kv, n_head_kv,
-                memory_v_->nb[2], memory_v_->nb[1], layer_off_v);
-            ggml_tensor * fa = ggml_flash_attn_ext(ctx0, ggml_permute(ctx0, q, 0, 2, 1, 3), k_all, v_all,
-                nullptr, attn_scale, 0.0f, 0.0f);
-            ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
-            ggml_tensor * attn_out = mul_mat_checked(ctx0, layer.wo, ggml_reshape_2d(ctx0, fa, q_size, n_tokens), "mul_mat:wo");
-            ggml_tensor * h     = ggml_add(ctx0, x, attn_out);
-            ggml_tensor * ff_in = rms_norm_weighted(ctx0, h, layer.ffn_norm, hparams_.rms_norm_eps);
-            ggml_tensor * gate  = mul_mat_checked(ctx0, layer.w1, ff_in, "mul_mat:w1");
-            ggml_tensor * up    = mul_mat_checked(ctx0, layer.w3, ff_in, "mul_mat:w3");
-            ggml_tensor * ff_out = mul_mat_checked(ctx0, layer.w2, ggml_swiglu_split(ctx0, gate, up), "mul_mat:w2");
-            x = ggml_add(ctx0, h, ff_out);
-            continue;
-        }
 
         ggml_tensor * k_mem = k;
         ggml_tensor * v_mem = v;
@@ -1121,6 +1142,10 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
     }
     for (int32_t cb = 0; cb < hparams_.num_codebooks; ++cb) {
         ggml_backend_tensor_set(cb_id_tensors[cb], cb_vals[cb].data(), 0, n_tokens * sizeof(int32_t));
+    }
+    if (kv_idx) {
+        ggml_backend_tensor_set(kv_idx,  &n_past_,            0, sizeof(int32_t));
+        ggml_backend_tensor_set(kq_mask, kq_mask_vals.data(), 0, n_kv * sizeof(ggml_fp16_t));
     }
 
     if (ggml_backend_sched_graph_compute(sched_, gf) != GGML_STATUS_SUCCESS) {
@@ -1347,14 +1372,20 @@ bool SlowARModel::fast_decode_one(const std::vector<float> & hidden_in,
             fast_k_ = fast_v_ = nullptr;
             return false;
         }
+        // The attention reads every slot, masked or not: no NaN from uninitialised memory.
+        ggml_backend_buffer_clear(fast_kv_buf_, 0);
     }
-    if (pos >= hparams_.num_codebooks) return false;
+    const int32_t n_slots = hparams_.num_codebooks;
+    if (pos >= n_slots) return false;
 
     if (fast_ctx_size_ == 0) {
         fast_ctx_size_ = 8u * 1024u * 1024u;
         fast_ctx_buf_.resize(fast_ctx_size_);
     }
-    ggml_init_params p = { fast_ctx_size_, fast_ctx_buf_.data(), true };
+    if (fast_ctx_buf0_.empty()) fast_ctx_buf0_.resize(fast_ctx_size_);
+    // Position 0 builds a different graph (the hidden state in, not a token): its own buffer gives it
+    // another first node, which is what the CUDA backend keys its graphs on, so both stay captured.
+    ggml_init_params p = { fast_ctx_size_, pos == 0 ? fast_ctx_buf0_.data() : fast_ctx_buf_.data(), true };
     ggml_context * ctx0 = ggml_init(p);
     if (!ctx0) return false;
     ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 16384, false);
@@ -1374,6 +1405,11 @@ bool SlowARModel::fast_decode_one(const std::vector<float> & hidden_in,
     if (x->type != GGML_TYPE_F32) x = ggml_cast(ctx0, x, GGML_TYPE_F32);
 
     ggml_tensor * positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    ggml_tensor * kq_mask   = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_slots, 1);
+    std::vector<ggml_fp16_t> kq_mask_vals(n_slots);
+    for (int32_t j = 0; j < n_slots; ++j) {
+        kq_mask_vals[j] = ggml_fp32_to_fp16(j <= pos ? 0.0f : -INFINITY);
+    }
 
     for (int32_t il = 0; il < n_layer; ++il) {
         const auto & layer = weights_.fast_layers[il];
@@ -1402,17 +1438,20 @@ bool SlowARModel::fast_decode_one(const std::vector<float> & hidden_in,
 
         const size_t layer_off_k = static_cast<size_t>(il) * fast_k_->nb[3];
         const size_t layer_off_v = static_cast<size_t>(il) * fast_v_->nb[3];
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, k, ggml_view_3d(ctx0, fast_k_, head_dim, n_head_kv, 1,
-            fast_k_->nb[1], fast_k_->nb[2], layer_off_k + pos * fast_k_->nb[2])));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, v, ggml_view_3d(ctx0, fast_v_, head_dim, n_head_kv, 1,
-            fast_v_->nb[1], fast_v_->nb[2], layer_off_v + pos * fast_v_->nb[2])));
-
-        ggml_tensor * k_all = ggml_view_3d(ctx0, fast_k_, head_dim, pos + 1, n_head_kv,
-            fast_k_->nb[2], fast_k_->nb[1], layer_off_k);
-        ggml_tensor * v_all = ggml_view_3d(ctx0, fast_v_, head_dim, pos + 1, n_head_kv,
-            fast_v_->nb[2], fast_v_->nb[1], layer_off_v);
+        // Same shapes at every position (see eval_cached): the token goes in by row index (the positions
+        // tensor), the attention spans all slots with the later ones masked.
+        ggml_tensor * k_set = ggml_set_rows(ctx0,
+            ggml_view_2d(ctx0, fast_k_, kv_size, n_slots, fast_k_->nb[2], layer_off_k),
+            ggml_reshape_2d(ctx0, k, kv_size, 1), positions);
+        ggml_tensor * v_set = ggml_set_rows(ctx0,
+            ggml_view_2d(ctx0, fast_v_, kv_size, n_slots, fast_v_->nb[2], layer_off_v),
+            ggml_reshape_2d(ctx0, v, kv_size, 1), positions);
+        ggml_tensor * k_all = ggml_view_3d(ctx0, k_set, head_dim, n_slots, n_head_kv,
+            fast_k_->nb[2], fast_k_->nb[1], 0);
+        ggml_tensor * v_all = ggml_view_3d(ctx0, v_set, head_dim, n_slots, n_head_kv,
+            fast_v_->nb[2], fast_v_->nb[1], 0);
         ggml_tensor * fa = ggml_flash_attn_ext(ctx0, ggml_permute(ctx0, q, 0, 2, 1, 3), k_all, v_all,
-            nullptr, attn_scale, 0.0f, 0.0f);
+            kq_mask, attn_scale, 0.0f, 0.0f);
         ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
         ggml_tensor * attn_out = mul_mat_checked(ctx0, layer.wo, ggml_reshape_2d(ctx0, fa, q_size, 1), "mul_mat:fast_wo");
 
@@ -1438,6 +1477,7 @@ bool SlowARModel::fast_decode_one(const std::vector<float> & hidden_in,
 
     const int32_t pos_val = pos;
     ggml_backend_tensor_set(positions, &pos_val, 0, sizeof(int32_t));
+    ggml_backend_tensor_set(kq_mask, kq_mask_vals.data(), 0, n_slots * sizeof(ggml_fp16_t));
     if (hidden0) ggml_backend_tensor_set(hidden0, hidden_in.data(), 0, hidden_in.size() * sizeof(float));
     if (token_id) ggml_backend_tensor_set(token_id, &prefix_tokens.back(), 0, sizeof(int32_t));
 

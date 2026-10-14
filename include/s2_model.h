@@ -153,6 +153,7 @@ private:
     std::vector<uint8_t> ctx_buf_;
     size_t         fast_ctx_size_ = 0;
     std::vector<uint8_t> fast_ctx_buf_;
+    std::vector<uint8_t> fast_ctx_buf0_;
 
     // the fast decoder's keys and values within one frame, so each codebook step computes only its
     // own token; fast_cached_ is how many positions it holds (-1: unusable, take the full path).
