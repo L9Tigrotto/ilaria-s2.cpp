@@ -150,6 +150,16 @@ private:
     size_t         fast_ctx_size_ = 0;
     std::vector<uint8_t> fast_ctx_buf_;
 
+    // the fast decoder's keys and values within one frame, so each codebook step computes only its
+    // own token; fast_cached_ is how many positions it holds (-1: unusable, take the full path).
+    bool fast_decode_one(const std::vector<float> & hidden, const std::vector<int32_t> & prefix_codes,
+                         int32_t n_threads, std::vector<float> & logits_out);
+    ggml_context * fast_ctx_kv_ = nullptr;
+    ggml_backend_buffer_t fast_kv_buf_ = nullptr;
+    ggml_tensor *  fast_k_ = nullptr;
+    ggml_tensor *  fast_v_ = nullptr;
+    int32_t        fast_cached_ = -1;
+
     std::unordered_set<ggml_tensor *> weight_tensor_set_;
 
 };
