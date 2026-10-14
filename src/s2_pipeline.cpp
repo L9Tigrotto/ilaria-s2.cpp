@@ -5,6 +5,11 @@
 #include <cmath>
 #include <chrono>
 #include <limits>
+#include <atomic>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <unordered_set>
@@ -1001,8 +1006,8 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
     int32_t committed_frames = 0;
     double stream_decode_ms = 0.0;
     int32_t stream_decode_batches = 0;
-    bool stream_aborted = false;
-    bool stream_failed = false;
+    std::atomic<bool> stream_aborted{false};
+    std::atomic<bool> stream_failed{false};
     const int32_t stream_decode_stride_frames =
         params.stream_decode_stride_frames > 0 ? params.stream_decode_stride_frames : 4;
     const int32_t codec_context_frames = params.codec_decode_context_frames >= 0
@@ -1029,7 +1034,8 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
         return true;
     };
 
-    auto decode_window_and_emit = [&](int32_t total_frames, bool finalize) -> bool {
+    auto decode_window_and_emit = [&](const std::vector<std::vector<int32_t>> & codes_by_cb,
+                                      int32_t total_frames, bool finalize) -> bool {
         if (total_frames <= 0 || total_frames <= committed_frames) {
             return true;
         }
@@ -1049,15 +1055,15 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
 
         decode_codes.resize(static_cast<size_t>(num_codebooks) * window_frames);
         for (int32_t cb = 0; cb < num_codebooks; ++cb) {
-            if (static_cast<int32_t>(accumulated_codes_by_cb[cb].size()) < total_frames) {
+            if (static_cast<int32_t>(codes_by_cb[cb].size()) < total_frames) {
                 safe_print_error_ln("Pipeline streaming: internal codebook accumulation underflow.");
                 sink.on_error("Internal streaming codebook accumulation error");
                 stream_failed = true;
                 return false;
             }
             std::copy(
-                accumulated_codes_by_cb[cb].begin() + window_start_frame,
-                accumulated_codes_by_cb[cb].begin() + total_frames,
+                codes_by_cb[cb].begin() + window_start_frame,
+                codes_by_cb[cb].begin() + total_frames,
                 decode_codes.begin() + static_cast<size_t>(cb) * window_frames
             );
         }
@@ -1094,26 +1100,73 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
         return true;
     };
 
+    // The codec decodes on a thread of its own (and its own CUDA stream) while the model goes on generating. It
+    // takes the newest window waiting, so when it falls behind it decodes bigger windows instead of queueing up.
+    struct DecodeJob {
+        std::vector<std::vector<int32_t>> codes;
+        int32_t total_frames = 0;
+        bool finalize = false;
+    };
+    std::mutex job_mtx;
+    std::condition_variable job_cv;
+    std::optional<DecodeJob> job;
+    bool decoder_exit = false;
+    std::thread decoder([&] {
+        for (;;) {
+            DecodeJob j;
+            {
+                std::unique_lock<std::mutex> lock(job_mtx);
+                job_cv.wait(lock, [&] { return job.has_value() || decoder_exit; });
+                if (!job) return;
+                j = std::move(*job);
+                job.reset();
+            }
+            if (!decode_window_and_emit(j.codes, j.total_frames, j.finalize) || j.finalize) return;
+        }
+    });
+    auto submit = [&](int32_t total_frames, bool finalize) {
+        std::lock_guard<std::mutex> lock(job_mtx);
+        job = DecodeJob{ accumulated_codes_by_cb, total_frames, finalize };
+        job_cv.notify_one();
+    };
+    // Waits for a final window already given; a window that is not final is dropped.
+    auto stop_decoder = [&] {
+        {
+            std::lock_guard<std::mutex> lock(job_mtx);
+            if (job && !job->finalize) job.reset();
+            decoder_exit = true;
+        }
+        job_cv.notify_one();
+        if (decoder.joinable()) decoder.join();
+    };
+    struct JoinOnExit { std::function<void()> f; ~JoinOnExit() { f(); } } join_decoder{ stop_decoder };
+
+    int32_t last_submitted_frames = 0;
     GenerateParams gen_params = params.gen;
     gen_params.on_frame = [&](const FrameCallbackData & fcd) -> bool {
         if (sink.is_cancelled()) {
             stream_aborted = true;
             return false;
         }
+        if (stream_failed || stream_aborted) return false;
 
         for (int32_t cb = 0; cb < fcd.num_codebooks; ++cb) {
             accumulated_codes_by_cb[cb].push_back(fcd.codes[cb]);
         }
 
-        if ((fcd.total_frames - last_decoded_frames) < stream_decode_stride_frames) {
+        if ((fcd.total_frames - last_submitted_frames) < stream_decode_stride_frames) {
             return true;
         }
-        return decode_window_and_emit(fcd.total_frames, false);
+        last_submitted_frames = fcd.total_frames;
+        submit(fcd.total_frames, false);
+        return true;
     };
 
     const auto gen_t0 = std::chrono::steady_clock::now();
     GenerateResult res = generate(model(), tokenizer().config(), prompt, gen_params);
     const auto gen_t1 = std::chrono::steady_clock::now();
+    if (res.n_frames > 0 && !stream_failed && !stream_aborted) submit(res.n_frames, true);
+    stop_decoder();
 
     if (res.n_frames == 0) {
         if (stream_aborted) {
@@ -1129,13 +1182,6 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
     if (stream_failed || stream_aborted) {
         model().clear_kv_cache();
         return false;
-    }
-
-    if (res.n_frames > last_decoded_frames || committed_frames < res.n_frames) {
-        if (!decode_window_and_emit(res.n_frames, true)) {
-            model().clear_kv_cache();
-            return false;
-        }
     }
 
     sink.on_done();
