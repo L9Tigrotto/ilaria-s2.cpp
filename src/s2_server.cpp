@@ -467,9 +467,15 @@ namespace s2
             res.set_header("X-Request-Start",
                 std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
                     start.time_since_epoch()).count()));
+            // Allow browser clients on another origin (e.g. a webview app).
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_header("Access-Control-Expose-Headers", "X-Audio-Sample-Rate");
 
             return httplib::Server::HandlerResponse::Unhandled;
             });
+
+        // Readiness probe: answers once the model is loaded.
+        svr.Get("/health", [](const httplib::Request&, httplib::Response& res) { res.set_content("ok", "text/plain"); });
 
         svr.set_logger([](const auto& req, const auto& res)
             {
@@ -711,11 +717,18 @@ namespace s2
                     }
                 }
 
+                // wait for the request before instead of refusing at once. A stream ends a moment
+                // before its thread clears the busy flag, so the next sentence, sent as soon as the last one
+                // ended, was refused. Up to 60 s, then 503 as before.
                 bool expected_idle = false;
-                if (!server_busy->compare_exchange_strong(expected_idle, true)) {
-                    res.status = 503;
-                    res.set_content("Server busy processing another synthesis request.", "text/plain");
-                    return;
+                for (int waited = 0; !server_busy->compare_exchange_strong(expected_idle, true); ++waited) {
+                    expected_idle = false;
+                    if (waited >= 1200 || req.is_connection_closed()) {
+                        res.status = 503;
+                        res.set_content("Server busy processing another synthesis request.", "text/plain");
+                        return;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
 
                 auto release_busy = [&]() {
