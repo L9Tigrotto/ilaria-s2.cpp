@@ -1,5 +1,57 @@
 # s2.cpp
 
+## About this fork
+
+A fork of [rodrigomatta/s2.cpp](https://github.com/rodrigomatta/s2.cpp) that makes CUDA generation faster on older cards. It was tuned and measured on a GTX 1080 with 8 GB (Pascal). The engine, the model support and everything below this section are upstream's work. This fork only changes the decode loop, the codec's upsampling and a few server details.
+
+### What changed
+
+| Change | Generate (ms/frame) | Real time |
+|---|---|---|
+| Upstream `main` (2c33261) | 85–90 | 0.46x |
+| Slow-AR one-token steps: flash attention straight over the F16 KV cache | ~65 | |
+| Fast-AR: K/V cache within a frame, so each codebook computes only its own token | ~59 | |
+| Embedding tables on the GPU when every layer is (Q8_0/F16/F32 files) | 56.6 | 0.64x |
+| Codec: `conv_transpose_1d` as one matmul plus overlap-add (decode 11.6 to 5.9 ms/frame) | 56.6 | 0.68x |
+| Slow-AR head scores only the semantic tokens and the end token (~4,100 of 155,776 rows) | 53.2 | 0.70x |
+| Shape-stable decode graphs, CUDA graphs enabled on Pascal | 52.8 | 0.71x |
+| Decode graphs and their scheduler allocation kept between steps | 50.2 | 0.74x |
+| Sampler partial-sorts only the top k | 46.4 | **0.80x** |
+
+How it was measured:
+- GTX 1080 8 GB, Windows 11, CUDA 12.9, `s2-pro-q8_0.gguf`, all layers and the codec on the GPU (`--codec-follow-backend`).
+- HTTP server, warm, with a cloned voice profile.
+- 21 sentences of 2 to 6 s each.
+- Real time is seconds of audio per second of request, prefill and codec decode included.
+- A frame is 46 ms of audio, so real time needs about 46 ms per frame in all.
+
+Remaining ceiling: generation is now memory-bandwidth bound. Q8_0 matrix-vector products take about 40 ms of each frame (the Fast-AR runs 10 times per frame and reads about as many bytes as the Slow-AR), so CUDA graphs gain little on this card.
+
+Server changes:
+- `GET /health` reports when the model is loaded.
+- `--cors <origin>` adds CORS headers for browser clients; there are none by default.
+- A request that arrives while another synthesis is running waits up to 60 s instead of getting an immediate 503.
+
+Build: `S2_CUDA_GRAPHS` (CMake, default ON with CUDA) turns on ggml's CUDA graphs. Two patches in `patches/` are applied at build time, so the `ggml` submodule stays pinned to upstream:
+- **Pascal**: allows graphs on Pascal and newer (ggml enables them only from Ampere).
+- **Node-properties comparison**: fixes needless re-captures.
+
+### Quantization
+
+**`s2-pro-q4_k_m.gguf` is not usable for voice cloning here: the voice changes from sentence to sentence**, as if each one were spoken by a different person. Use `s2-pro-q8_0.gguf`. Q4_K_M quantizes the Fast-AR (which writes the acoustic codebooks) and the codebook embeddings that carry the reference voice in. A file with only the Slow-AR layers at Q4 runs at about 40 ms/frame and is being tested.
+
+### Credits
+
+- [rodrigomatta/s2.cpp](https://github.com/rodrigomatta/s2.cpp) and its contributors: the engine this fork builds on.
+- [@chen3feng](https://github.com/chen3feng), [rodrigomatta/s2.cpp#50](https://github.com/rodrigomatta/s2.cpp/pull/50): the ideas ported here (vocabulary-window logits, shape-stable graphs, graph caching, CUDA graphs) and the ggml node-properties patch, taken as is.
+- [Fish Audio](https://fish.audio): the S2 Pro model.
+- [ggml](https://github.com/ggml-org/ggml): the tensor library.
+- [rodrigomt/s2-pro-gguf](https://huggingface.co/rodrigomt/s2-pro-gguf): the GGUF files.
+
+License: unchanged. The engine source is a Derivative Work of the Fish Audio Materials under the Fish Audio Research License ([LICENSE.md](LICENSE.md)): research and non-commercial use only.
+
+---
+
 > **ALPHA — EXPERIMENTAL SOFTWARE**
 > This is an early-stage, community-built inference engine. Expect rough edges, missing features, and breaking changes. Not production-ready.
 
