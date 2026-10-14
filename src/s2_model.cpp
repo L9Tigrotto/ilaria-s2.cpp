@@ -1087,7 +1087,20 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
         last_token_view(ctx0, slow_cont, n_tokens),
         ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, dim, 1));
 
-    ggml_tensor * logits = mul_mat_checked(ctx0, weights_.embeddings, hidden_last, "mul_mat:logits");
+    // The head over the rows that can be sampled only (about 4,100 of 155,776): the semantic range, one
+    // contiguous block, and the end token.
+    const int32_t sem_begin = hparams_.semantic_begin_id;
+    const int32_t n_sem     = hparams_.semantic_end_id - sem_begin + 1;
+    ggml_tensor * emb = weights_.embeddings;
+    ggml_tensor * logits = mul_mat_checked(ctx0,
+        ggml_view_2d(ctx0, emb, emb->ne[0], n_sem, emb->nb[1], static_cast<size_t>(sem_begin) * emb->nb[1]),
+        hidden_last, "mul_mat:logits");
+    if (im_end_id_ >= 0 && (im_end_id_ < sem_begin || im_end_id_ >= sem_begin + n_sem)) {
+        ggml_tensor * end = mul_mat_checked(ctx0,
+            ggml_view_2d(ctx0, emb, emb->ne[0], 1, emb->nb[1], static_cast<size_t>(im_end_id_) * emb->nb[1]),
+            hidden_last, "mul_mat:logits_end");
+        logits = ggml_concat(ctx0, logits, end, 0);
+    }
     ggml_build_forward_expand(gf, logits);
 
     ggml_backend_cpu_set_n_threads(backend_cpu_, resolve_n_threads(n_threads));
@@ -1118,9 +1131,9 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
     }
 
     result.hidden.resize(dim);
-    result.logits.resize(hparams_.vocab_size);
+    result.logits.resize(logits->ne[0]);
     ggml_backend_tensor_get(hidden_last, result.hidden.data(), 0, dim * sizeof(float));
-    ggml_backend_tensor_get(logits,      result.logits.data(), 0, hparams_.vocab_size * sizeof(float));
+    ggml_backend_tensor_get(logits,      result.logits.data(), 0, logits->ne[0] * sizeof(float));
 
     ggml_backend_sched_reset(sched_);
     ggml_free(ctx0);

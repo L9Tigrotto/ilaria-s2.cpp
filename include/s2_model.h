@@ -86,6 +86,8 @@ struct ModelWeights {
 
 struct StepResult {
     std::vector<float> hidden;
+    // Scores of the semantic tokens only (semantic_begin_id..semantic_end_id), then, when the model was given
+    // an end token outside that range (set_im_end_id), of the end token as the last entry.
     std::vector<float> logits;
 };
 
@@ -130,6 +132,8 @@ public:
 
     const ModelHParams & hparams() const { return hparams_; }
 
+    void set_im_end_id(int32_t id) { im_end_id_ = id; }
+
     ModelWeights   weights_;
 
 private:
@@ -159,6 +163,8 @@ private:
     ggml_tensor *  fast_k_ = nullptr;
     ggml_tensor *  fast_v_ = nullptr;
     int32_t        fast_cached_ = -1;
+
+    int32_t        im_end_id_ = -1;
 
     std::unordered_set<ggml_tensor *> weight_tensor_set_;
 

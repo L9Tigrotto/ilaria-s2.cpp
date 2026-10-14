@@ -19,20 +19,15 @@ GenerateResult generate(
     out.num_codebooks = model.hparams().num_codebooks;
     if (out.num_codebooks <= 0) out.num_codebooks = 1;
 
-    const int32_t vocab_size   = model.hparams().vocab_size;
     const int32_t sem_begin    = model.hparams().semantic_begin_id;
     const int32_t sem_end      = model.hparams().semantic_end_id;
+    const int32_t n_sem        = sem_end - sem_begin + 1;
     const int32_t codebook_size = model.hparams().codebook_size;
     const int32_t im_end_id    = config.im_end_id;
     const int32_t num_cb       = out.num_codebooks;
 
-    std::vector<float> sem_mask(vocab_size, -std::numeric_limits<float>::infinity());
-    for (int32_t i = sem_begin; i <= sem_end && i < vocab_size; ++i) {
-        sem_mask[i] = 0.0f;
-    }
-    if (im_end_id >= 0 && im_end_id < vocab_size) {
-        sem_mask[im_end_id] = 0.0f;
-    }
+    // The model scores only what may be sampled (see StepResult::logits).
+    model.set_im_end_id(im_end_id);
 
     const int32_t rows = prompt.rows;
     const int32_t cols = prompt.cols;
@@ -54,34 +49,30 @@ GenerateResult generate(
     }
     const auto prefill_t1 = std::chrono::steady_clock::now();
 
-    auto apply_mask_and_sample = [&](const std::vector<float> & logits,
-                                     bool block_im_end) -> int32_t {
-        std::vector<float> biased(vocab_size);
-        for (int32_t i = 0; i < vocab_size; ++i) {
-            biased[i] = logits[i] + sem_mask[i];
+    SamplerParams sparams;
+    sparams.temperature     = params.temperature;
+    sparams.top_p           = params.top_p;
+    sparams.top_k           = params.top_k;
+
+    // Entry i of state.logits is semantic token sem_begin + i; an entry past them is the end token.
+    auto sample_main = [&](const SamplerParams & sp, bool block_im_end) -> int32_t {
+        std::vector<float> biased = state.logits;
+        const int32_t end_idx = (im_end_id >= sem_begin && im_end_id <= sem_end) ? im_end_id - sem_begin
+                              : (int32_t)biased.size() > n_sem ? n_sem : -1;
+        if (block_im_end && end_idx >= 0) {
+            biased[end_idx] = -std::numeric_limits<float>::infinity();
         }
-        if (block_im_end && im_end_id >= 0 && im_end_id < vocab_size) {
-            biased[im_end_id] = -std::numeric_limits<float>::infinity();
-        }
-        SamplerParams sparams;
-        sparams.temperature     = params.temperature;
-        sparams.top_p           = params.top_p;
-        sparams.top_k           = params.top_k;
-        return sample_token(biased.data(), vocab_size, sparams);
+        const int32_t idx = sample_token(biased.data(), (int32_t)biased.size(), sp);
+        return idx < n_sem ? sem_begin + idx : im_end_id;
     };
 
     bool block_end = (params.min_tokens_before_end > 0);
-    int32_t main_token = apply_mask_and_sample(state.logits, block_end);
+    int32_t main_token = sample_main(sparams, block_end);
 
     out.codes.resize(static_cast<size_t>(num_cb) * params.max_new_tokens, 0);
     out.n_frames = 0;
 
     std::vector<float> fast_logits;
-
-    SamplerParams sparams;
-    sparams.temperature     = params.temperature;
-    sparams.top_p           = params.top_p;
-    sparams.top_k           = params.top_k;
 
     std::vector<int32_t> ras_window;
     const int32_t ras_window_size = 10;
@@ -100,19 +91,11 @@ GenerateResult generate(
             std::find(ras_window.begin(), ras_window.end(), main_token) != ras_window.end() &&
             main_token >= sem_begin && main_token <= sem_end)
         {
-
-            std::vector<float> biased(vocab_size);
-            for (int32_t i = 0; i < vocab_size; ++i) {
-                biased[i] = state.logits[i] + sem_mask[i];
-            }
-            if (step < params.min_tokens_before_end && im_end_id >= 0 && im_end_id < vocab_size) {
-                biased[im_end_id] = -std::numeric_limits<float>::infinity();
-            }
             SamplerParams ras_sparams;
             ras_sparams.temperature = ras_high_temp;
             ras_sparams.top_p       = ras_high_top_p;
             ras_sparams.top_k       = params.top_k;
-            main_token = sample_token(biased.data(), vocab_size, ras_sparams);
+            main_token = sample_main(ras_sparams, step < params.min_tokens_before_end);
         }
 
         ras_window.push_back(main_token);
@@ -179,7 +162,7 @@ GenerateResult generate(
         }
 
         bool block_next_end = (step < params.min_tokens_before_end);
-        main_token = apply_mask_and_sample(state.logits, block_next_end);
+        main_token = sample_main(sparams, block_next_end);
     }
 
     if (params.verbose && log_enabled(LogLevel::Info)) {
