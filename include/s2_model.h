@@ -86,8 +86,9 @@ struct ModelWeights {
 
 struct StepResult {
     std::vector<float> hidden;
-    // Scores of the semantic tokens only (semantic_begin_id..semantic_end_id), then, when the model was given
-    // an end token outside that range (set_im_end_id), of the end token as the last entry.
+    // Scores over the whole vocab, unless the model was given the end token (set_im_end_id): then the
+    // semantic tokens only (semantic_begin_id..semantic_end_id), followed, when the end token lies outside
+    // that range, by the end token's score as the last entry.
     std::vector<float> logits;
 };
 
@@ -132,7 +133,11 @@ public:
 
     const ModelHParams & hparams() const { return hparams_; }
 
-    void set_im_end_id(int32_t id) { im_end_id_ = id; }
+    // Narrows StepResult::logits to what can be sampled (see there); a negative id restores the whole vocab.
+    void set_im_end_id(int32_t id) {
+        if (id != im_end_id_) drop_graph(slow_graph_, sched_); // its output head depends on it
+        im_end_id_ = id;
+    }
 
     ModelWeights   weights_;
 
@@ -155,8 +160,8 @@ private:
     std::vector<uint8_t> fast_ctx_buf_;
     std::vector<uint8_t> fast_ctx_buf0_;
 
-    // the fast decoder's keys and values within one frame, so each codebook step computes only its
-    // own token; fast_cached_ is how many positions it holds (-1: unusable, take the full path).
+    // The Fast-AR's keys and values within one frame, so each codebook step computes only its own
+    // token; fast_cached_ is how many positions it holds (-1: unusable, take the full path).
     bool fast_decode_one(const std::vector<float> & hidden, const std::vector<int32_t> & prefix_codes,
                          int32_t n_threads, std::vector<float> & logits_out);
     ggml_context * fast_ctx_kv_ = nullptr;

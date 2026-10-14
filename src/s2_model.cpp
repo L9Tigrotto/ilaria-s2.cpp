@@ -489,13 +489,16 @@ bool SlowARModel::load_shared(gguf_context * ctx_gguf, const std::string & gguf_
         backend_type != BackendType::CUDA &&
         n_gpu_layers_ == hparams_.block_count;
 
-    // with every layer on the GPU and tables CUDA's get_rows can read (Q8_0, F16, F32; not the K-quants
-    // the CPU rule below is for), the tables go to the GPU too, so a one-token step is one GPU graph instead of
-    // three pieces with a CPU round trip between them.
-    const ggml_type emb_type = weights_.embeddings->type;
+    // With every layer on the GPU and embedding tables that CUDA's get_rows can read (Q8_0, F16, F32; not the
+    // K-quants the CPU rule below is for), the tables go to the GPU too, so a one-token step is one GPU graph
+    // instead of three pieces with a CPU round trip between them.
+    auto gpu_readable = [](const ggml_tensor * t) {
+        return t == nullptr || t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_F32;
+    };
     const bool tables_on_gpu =
         backend_gpu_ != nullptr && n_gpu_layers_ == hparams_.block_count &&
-        (emb_type == GGML_TYPE_Q8_0 || emb_type == GGML_TYPE_F16 || emb_type == GGML_TYPE_F32);
+        gpu_readable(weights_.embeddings) && gpu_readable(weights_.codebook_embeddings) &&
+        gpu_readable(weights_.fast_embeddings);
 
     auto get_weight_backend = [&](const std::string & name) -> ggml_backend_t {
 
@@ -1050,7 +1053,7 @@ bool SlowARModel::build_slow_graph(int32_t n_tokens, int32_t n_kv) {
 
         const size_t layer_off_k = static_cast<size_t>(il) * memory_k_->nb[3];
         const size_t layer_off_v = static_cast<size_t>(il) * memory_v_->nb[3];
-        // one token (every frame after the prefill): fused attention straight over the F16 cache,
+        // One token (every frame after the prefill): fused attention straight over the F16 cache,
         // which already holds this token. The general path below casts, concatenates and repeats the whole
         // history per layer and per frame, about 15 kernels more per layer.
         // The graph has the same shapes and offsets from frame to frame, so the CUDA backend can replay it
@@ -1145,14 +1148,16 @@ bool SlowARModel::build_slow_graph(int32_t n_tokens, int32_t n_kv) {
         last_token_view(ctx0, slow_cont, n_tokens),
         ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, dim, 1));
 
-    // The head over the rows that can be sampled only (about 4,100 of 155,776): the semantic range, one
-    // contiguous block, and the end token.
+    // Once the end token is known (set_im_end_id), the head covers only the rows that can be sampled (about
+    // 4,100 of 155,776): the semantic range, one contiguous block, and the end token. Otherwise the whole vocab.
     const int32_t sem_begin = hparams_.semantic_begin_id;
     const int32_t n_sem     = hparams_.semantic_end_id - sem_begin + 1;
     ggml_tensor * emb = weights_.embeddings;
-    ggml_tensor * logits = mul_mat_checked(ctx0,
-        ggml_view_2d(ctx0, emb, emb->ne[0], n_sem, emb->nb[1], static_cast<size_t>(sem_begin) * emb->nb[1]),
-        hidden_last, "mul_mat:logits");
+    ggml_tensor * logits = im_end_id_ < 0
+        ? mul_mat_checked(ctx0, emb, hidden_last, "mul_mat:logits")
+        : mul_mat_checked(ctx0,
+            ggml_view_2d(ctx0, emb, emb->ne[0], n_sem, emb->nb[1], static_cast<size_t>(sem_begin) * emb->nb[1]),
+            hidden_last, "mul_mat:logits");
     if (im_end_id_ >= 0 && (im_end_id_ < sem_begin || im_end_id_ >= sem_begin + n_sem)) {
         ggml_tensor * end = mul_mat_checked(ctx0,
             ggml_view_2d(ctx0, emb, emb->ne[0], 1, emb->nb[1], static_cast<size_t>(im_end_id_) * emb->nb[1]),
@@ -1186,7 +1191,9 @@ void SlowARModel::drop_graph(CachedGraph & g, ggml_backend_sched_t sched) {
 bool SlowARModel::run_graph(CachedGraph & g, ggml_backend_sched_t sched,
                             const std::vector<std::pair<const void *, size_t>> & in_vals,
                             std::vector<float> & logits_out) {
+    GGML_ASSERT(in_vals.size() == g.in.size());
     for (size_t i = 0; i < g.in.size(); ++i) {
+        GGML_ASSERT(in_vals[i].second == ggml_nbytes(g.in[i]));
         ggml_backend_tensor_set(g.in[i], in_vals[i].first, 0, in_vals[i].second);
     }
     if (ggml_backend_sched_graph_compute(sched, g.gf) != GGML_STATUS_SUCCESS) {
@@ -1194,6 +1201,7 @@ bool SlowARModel::run_graph(CachedGraph & g, ggml_backend_sched_t sched,
         drop_graph(g, sched);
         return false;
     }
+    if (!g.logits) return true;
     logits_out.resize(g.logits->ne[0]);
     ggml_backend_tensor_get(g.logits, logits_out.data(), 0, g.logits->ne[0] * sizeof(float));
     return true;
@@ -1229,20 +1237,18 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
     const float attn_scale  = 1.0f / std::sqrt(static_cast<float>(head_dim));
     const int32_t n_tokens  = static_cast<int32_t>(prefix_tokens.size()) + 1;
 
-    // a frame's codebooks come one by one; when the cache holds every earlier one, compute only the new one.
+    // A frame's codebooks come one by one; when the cache holds every earlier one, compute only the new one.
     // A frame starts with one prefix token (its semantic code): position 0, the hidden state, is filled first.
+    // Any other call (no prefix, or out of order) takes the full path below.
     const int32_t n_prefix = static_cast<int32_t>(prefix_tokens.size());
-    if (n_prefix <= 1) {
+    if (n_prefix == 1) {
         fast_cached_ = -1;
         std::vector<float> unused;
-        if (n_prefix == 0 || fast_decode_one(hidden_in, {}, n_threads, unused)) {
-            if (fast_decode_one(hidden_in, prefix_tokens, n_threads, logits_out)) return true;
-        }
-    } else if (n_prefix == fast_cached_) {
+        if (fast_decode_one(hidden_in, {}, n_threads, unused) &&
+            fast_decode_one(hidden_in, prefix_tokens, n_threads, logits_out)) return true;
+    } else if (n_prefix > 1 && n_prefix == fast_cached_) {
         if (fast_decode_one(hidden_in, prefix_tokens, n_threads, logits_out)) return true;
     }
-    static bool told = false;
-    if (!told) { told = true; std::fprintf(stderr, "[fast_decode] cached path not taken at %d, full path\n", n_prefix); }
     fast_cached_ = -1;
     drop_graph(fast_graph_[1], fast_sched_); // this path uses the same scheduler and context buffer
 
@@ -1513,9 +1519,15 @@ bool SlowARModel::fast_decode_one(const std::vector<float> & hidden_in,
         x = ggml_add(ctx0, h, ff_out);
     }
 
-    ggml_tensor * fast_out = rms_norm_weighted(ctx0, x, weights_.fast_norm, hparams_.fast_rms_norm_eps);
-    ggml_tensor * logits = mul_mat_checked(ctx0, weights_.fast_output, fast_out, "mul_mat:fast_logits");
-    ggml_build_forward_expand(gf, logits);
+    // Position 0 only fills the cache: no output head (its scores would be thrown away).
+    ggml_tensor * logits = nullptr;
+    if (pos == 0) {
+        ggml_build_forward_expand(gf, x);
+    } else {
+        ggml_tensor * fast_out = rms_norm_weighted(ctx0, x, weights_.fast_norm, hparams_.fast_rms_norm_eps);
+        logits = mul_mat_checked(ctx0, weights_.fast_output, fast_out, "mul_mat:fast_logits");
+        ggml_build_forward_expand(gf, logits);
+    }
 
     // Same order as in_vals.
     g = { ctx0, gf, pos == 0 ? 0 : 1, { positions, kq_mask, pos == 0 ? hidden0 : token_id }, nullptr, logits };

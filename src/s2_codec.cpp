@@ -240,7 +240,7 @@ static ggml_tensor * causal_conv_transpose_1d(ggml_context * ctx,
     ggml_tensor * y = nullptr;
     const int64_t K = weight->ne[0], c_out = weight->ne[1], c_in = weight->ne[2];
     if (K % stride == 0 && x->ne[0] == c_in) {
-        // as one matrix product and an overlap-add. ggml's CUDA conv_transpose_1d took about half of a
+        // Computed as one matrix product and an overlap-add. ggml's CUDA conv_transpose_1d took about half of a
         // decode on a GTX 1080; this is the same sum. Input position l, tap k, output channel c lands on output
         // sample l * stride + k: the product gives every (k, c, l), and the K / stride groups of taps are summed
         // with a shift of one block of stride samples each.
