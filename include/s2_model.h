@@ -167,6 +167,25 @@ private:
 
     int32_t        im_end_id_ = -1;
 
+    // A decode graph kept with its scheduler allocation, so the next call only uploads input values
+    // (and the CUDA backend replays it as a CUDA graph). key: what its shape depends on.
+    struct CachedGraph {
+        ggml_context * ctx = nullptr;
+        ggml_cgraph  * gf  = nullptr;
+        int32_t        key = -1;
+        std::vector<ggml_tensor *> in;
+        ggml_tensor *  hidden = nullptr;
+        ggml_tensor *  logits = nullptr;
+    };
+    CachedGraph slow_graph_;
+    CachedGraph fast_graph_[2];                // position 0, positions after it
+    ggml_backend_sched_t fast_sched0_ = nullptr; // position 0's own, so both allocations stay
+    bool build_slow_graph(int32_t n_tokens, int32_t n_kv);
+    static void drop_graph(CachedGraph & g, ggml_backend_sched_t sched);
+    static bool run_graph(CachedGraph & g, ggml_backend_sched_t sched,
+                          const std::vector<std::pair<const void *, size_t>> & in_vals,
+                          std::vector<float> & logits_out);
+
     std::unordered_set<ggml_tensor *> weight_tensor_set_;
 
 };
