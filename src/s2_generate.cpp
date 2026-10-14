@@ -43,8 +43,11 @@ GenerateResult generate(
         std::cout << "[Generate] Prefilling " << prompt.cols << " tokens..." << std::endl;
     }
     const auto prefill_t0 = std::chrono::steady_clock::now();
-    if (!model.prefill_fast(prompt_tm, prompt.cols, params.n_threads, state)) {
+    const int32_t reused = model.reuse_prefix(prompt_tm, prompt.prefix_cols);
+    if (reused > 0) prompt_tm.erase(prompt_tm.begin(), prompt_tm.begin() + static_cast<size_t>(reused) * rows);
+    if (!model.prefill_fast(prompt_tm, prompt.cols - reused, params.n_threads, state)) {
         std::cerr << "[Generate] Prefill failed." << std::endl;
+        model.clear_kv_cache(); // the prefix it was writing is not whole
         return out;
     }
     const auto prefill_t1 = std::chrono::steady_clock::now();
@@ -175,7 +178,7 @@ GenerateResult generate(
         std::cout << std::endl;
         std::cout << "[Generate] Done: " << out.n_frames << " frames generated." << std::endl;
         std::cout << "[Metrics] Generate: prefill=" << prefill_ms
-                  << " ms, loop=" << loop_ms
+                  << " ms (" << (prompt.cols - reused) << " of " << prompt.cols << " tokens), loop=" << loop_ms
                   << " ms, total=" << total_ms
                   << " ms, avg=" << ms_per_frame
                   << " ms/frame" << std::endl;

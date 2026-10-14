@@ -834,7 +834,6 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
     }
 
     CodecDecodeCacheScope codec_decode_cache_scope(codec());
-    model().clear_kv_cache();
 
     safe_print_ln("--- Pipeline Synthesize ---");
     safe_print_ln("Text: " + params.text);
@@ -877,7 +876,6 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
     }
     const auto decode_t1 = std::chrono::steady_clock::now();
 
-    model().clear_kv_cache();
     const auto synth_t1 = std::chrono::steady_clock::now();
 
     const double kv_ms = std::chrono::duration<double, std::milli>(kv_t1 - kv_t0).count();
@@ -964,7 +962,6 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
     }
 
     CodecDecodeCacheScope codec_decode_cache_scope(codec());
-    model().clear_kv_cache();
 
     safe_print_ln("--- Pipeline Streaming Synthesize ---");
     safe_print_ln("Text: " + params.text);
@@ -1143,7 +1140,6 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
 
     sink.on_done();
     safe_print_ln("Streaming synthesis complete: " + std::to_string(res.n_frames) + " frames");
-    model().clear_kv_cache();
     const auto synth_t1 = std::chrono::steady_clock::now();
 
     const double kv_ms = std::chrono::duration<double, std::milli>(kv_t1 - kv_t0).count();

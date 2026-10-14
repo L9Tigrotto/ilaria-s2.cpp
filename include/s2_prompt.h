@@ -12,6 +12,7 @@ struct PromptTensor {
     std::vector<int32_t> data;
     int32_t rows    = 0;
     int32_t cols    = 0;
+    int32_t prefix_cols = 0; // the system text and the reference: the same for every request with one voice
 };
 
 PromptTensor build_prompt(

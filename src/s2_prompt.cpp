@@ -73,6 +73,7 @@ PromptTensor build_prompt(
 
     int32_t total_len = (int32_t)sys_pre.size() + (has_reference ? T_prompt : 0) + (int32_t)sys_post.size();
     result.cols = total_len;
+    result.prefix_cols = has_reference ? (int32_t)sys_pre.size() + T_prompt : 0;
 
     result.data.assign(static_cast<size_t>(result.rows) * total_len, 0);
 

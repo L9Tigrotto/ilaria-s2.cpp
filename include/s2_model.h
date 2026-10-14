@@ -106,7 +106,12 @@ public:
     ggml_context * weights_ctx() { return weights_.ctx_w; }
     const std::unordered_set<ggml_tensor *> & weight_tensor_set() const { return weight_tensor_set_; }
 
+    // Keeps the cache (and the prefix in it) while it holds max_seq_len tokens; else allocates a new one.
     bool init_kv_cache(int32_t max_seq_len);
+
+    // A request whose first n_prefix tokens equal those of the request before (a voice's reference prompt) starts
+    // after them: their keys and values are still in the cache. Returns how many tokens need no prefill.
+    int32_t reuse_prefix(const std::vector<int32_t> & flat_tokens, int32_t n_prefix);
 
     void reset();
 
@@ -154,6 +159,7 @@ private:
     int32_t        max_seq_len_ = 0;
     int32_t        n_gpu_layers_ = -1;
     int32_t        n_past_     = 0;
+    std::vector<int32_t> kept_prefix_; // the tokens whose keys and values head the cache (see reuse_prefix)
     size_t         ctx_size_   = 0;
     std::vector<uint8_t> ctx_buf_;
     size_t         fast_ctx_size_ = 0;

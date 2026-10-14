@@ -734,8 +734,10 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t gpu_device, Backen
 
 bool SlowARModel::init_kv_cache(int32_t max_seq_len) {
     drop_graph(slow_graph_, sched_); // it points into the KV cache made again here
-    max_seq_len_ = max_seq_len;
-    n_past_      = 0;
+    n_past_ = 0;
+    if (kv_buf_ && max_seq_len <= max_seq_len_) return true;
+    clear_kv_cache();
+    max_seq_len_ = GGML_PAD(max_seq_len, 256); // room for a slightly longer next request
 
     const int32_t dim = hparams_.embedding_length;
     if (dim == 0) return true;
@@ -762,8 +764,8 @@ bool SlowARModel::init_kv_cache(int32_t max_seq_len) {
         return false;
     }
 
-    memory_k_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F16, head_dim, n_head_kv, max_seq_len, n_layer);
-    memory_v_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F16, head_dim, n_head_kv, max_seq_len, n_layer);
+    memory_k_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F16, head_dim, n_head_kv, max_seq_len_, n_layer);
+    memory_v_ = ggml_new_tensor_4d(ctx_kv_, GGML_TYPE_F16, head_dim, n_head_kv, max_seq_len_, n_layer);
 
     ggml_backend_t kv_backend = (n_gpu_layers_ > 0 && backend_gpu_) ? backend_gpu_ : backend_cpu_;
     kv_buf_ = ggml_backend_alloc_ctx_tensors(ctx_kv_, kv_backend);
@@ -804,6 +806,22 @@ void SlowARModel::clear_kv_cache() {
 
     max_seq_len_ = 0;
     n_past_ = 0;
+    kept_prefix_.clear();
+}
+
+int32_t SlowARModel::reuse_prefix(const std::vector<int32_t> & flat_tokens, int32_t n_prefix) {
+    const size_t n = static_cast<size_t>(std::max(0, n_prefix)) * (hparams_.num_codebooks + 1);
+    if (n == 0 || n > flat_tokens.size() || !kv_buf_ || n_past_ != 0) {
+        kept_prefix_.clear();
+        return 0;
+    }
+    if (kept_prefix_.size() == n && std::equal(kept_prefix_.begin(), kept_prefix_.end(), flat_tokens.begin())) {
+        n_past_ = n_prefix;
+        return n_prefix;
+    }
+    // The prefill that follows writes this prefix first.
+    kept_prefix_.assign(flat_tokens.begin(), flat_tokens.begin() + n);
+    return 0;
 }
 bool SlowARModel::prefill_fast(const std::vector<int32_t> & flat_tokens, int32_t n_tokens,
                           int32_t n_threads, StepResult & result) {
