@@ -1,0 +1,17 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index da48f31..d4e8be6 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -782,6 +782,12 @@ static void mul_mat_vec_q_switch_ncols_dst(
+             use = false;
+         }
+ 
++        // Pascal, Q8_0, one column: rows of up to 128 blocks (K <= 4096) go faster with several rows a block,
++        // 6 % over a transformer layer of K 2560 on a GTX 1080 (test-backend-ops perf).
++        if (is_nvidia_pascal_older && type == GGML_TYPE_Q8_0 && c_ncols_dst == 1 && nwarps > 1) {
++            use = blocks_per_row_x <= 128;
++        }
++
+         return use;
+     };
+ 

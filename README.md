@@ -32,9 +32,10 @@ Server changes:
 - `--cors <origin>` adds CORS headers for browser clients; there are none by default.
 - A request that arrives while another synthesis is running waits up to 60 s instead of getting an immediate 503.
 
-Build: `S2_CUDA_GRAPHS` (CMake, default ON with CUDA) turns on ggml's CUDA graphs. Two patches in `patches/` are applied at build time, so the `ggml` submodule stays pinned to upstream:
+Build: `S2_CUDA_GRAPHS` (CMake, default ON with CUDA) turns on ggml's CUDA graphs. Three patches in `patches/` are applied at build time, so the `ggml` submodule stays pinned to upstream:
 - **Pascal**: allows graphs on Pascal and newer (ggml enables them only from Ampere).
 - **Node-properties comparison**: fixes needless re-captures.
+- **Pascal Q8_0 matrix-vector**: several rows per block when K <= 4096, about 6 % faster per layer on a GTX 1080 (`test-backend-ops perf`), 1 to 3 ms a frame.
 
 ### Quantization
 
