@@ -2,7 +2,7 @@
 
 ## About this fork
 
-A fork of [rodrigomatta/s2.cpp](https://github.com/rodrigomatta/s2.cpp) that makes CUDA generation faster on older cards. It was tuned and measured on a GTX 1080 with 8 GB (Pascal). The engine, the model support and everything below this section are upstream's work. This fork only changes the decode loop, the codec's upsampling and a few server details.
+A fork of [rodrigomatta/s2.cpp](https://github.com/rodrigomatta/s2.cpp) that makes CUDA generation faster on older cards. It was tuned and measured on a GTX 1080 with 8 GB (Pascal). The engine, the model support and everything below this section are upstream's work. This fork only changes the decode loop, the codec's upsampling, the streaming pipeline and a few server details.
 
 ### What changed
 
@@ -27,19 +27,24 @@ How it was measured:
 
 Remaining ceiling: generation is now memory-bandwidth bound. Q8_0 matrix-vector products take about 40 ms of each frame (the Fast-AR runs 10 times per frame and reads about as many bytes as the Slow-AR), so CUDA graphs gain little on this card.
 
+Streaming and first audio:
+- **Voice prefix KV cache.** The KV cache outlives a request. A request whose system text and reference audio match the last one's prefills only its own text: prefill drops from 420–480 ms to 70–80 ms from the second sentence on.
+- **Codec on its own thread.** In a stream, the codec decodes windows on a thread with its own CUDA backend, and skips to the newest window when it falls behind.
+- Measured on a scene of six sentences (about 25 s of speech) sent one after another, with `stream_holdback_frames` 0, `stream_decode_stride_frames` 32, `codec_decode_context_frames` 16 and `stream_start_buffer_ms` 0: first audio after about 1.5 s and no gaps on q4_k_m. On q8_0 first audio comes after about 2 s, and speech is made at about 0.86x real time, so playback needs to start about 3.3 s later to have no gaps.
+
 Server changes:
 - `GET /health` reports when the model is loaded.
 - `--cors <origin>` adds CORS headers for browser clients; there are none by default.
 - A request that arrives while another synthesis is running waits up to 60 s instead of getting an immediate 503.
 
-Build: `S2_CUDA_GRAPHS` (CMake, default ON with CUDA) turns on ggml's CUDA graphs. Three patches in `patches/` are applied at build time, so the `ggml` submodule stays pinned to upstream:
+Build: `S2_CUDA_GRAPHS` (CMake, default ON with CUDA) turns on ggml's CUDA graphs. The patches in `patches/` are applied at build time, so the `ggml` submodule stays pinned to upstream. This fork adds three:
 - **Pascal**: allows graphs on Pascal and newer (ggml enables them only from Ampere).
 - **Node-properties comparison**: fixes needless re-captures.
 - **Pascal Q8_0 matrix-vector**: several rows per block when K <= 4096, about 6 % faster per layer on a GTX 1080 (`test-backend-ops perf`), 1 to 3 ms a frame.
 
 ### Quantization
 
-`s2-pro-q4_k_m.gguf` works for voice cloning on this fork. An earlier note here said the voice changed from sentence to sentence; that came from a single take. Checked since: the fork's decode steps match the general paths as closely on q4_k_m as on q8_0, and in a blind test of six q4_k_m takes (three from this fork, three from upstream) none changed voice. On a GTX 1080, generation takes about 36 ms per frame with q4_k_m and 45 with q8_0 (a frame is about 46 ms of speech).
+On a GTX 1080, generation takes about 45 ms per frame with `s2-pro-q8_0.gguf` and 36 with `s2-pro-q4_k_m.gguf` (a frame is about 46 ms of speech). Both keep a cloned voice: in a blind test of six q4_k_m takes, three from this fork and three from upstream, none changed voice. In a listening test q8_0 still sounded better. A file with only the Slow-AR layers in Q4_K and everything else in Q8_0 runs at about 40 ms per frame and kept more of the expression than q4_k_m: the Fast-AR, which writes the acoustic codebooks, is where Q4 costs.
 
 ### Credits
 
