@@ -14,6 +14,7 @@ namespace s2
   {
     std::string host = "127.0.0.1";
     int32_t port = 3030;
+    std::string cors_origin; // Access-Control-Allow-Origin for browser clients; empty: no CORS headers
 
     PipelineParams pipeline;
   };

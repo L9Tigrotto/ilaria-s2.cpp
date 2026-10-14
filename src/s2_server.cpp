@@ -18,6 +18,26 @@ namespace fs = ghc::filesystem;
 
 namespace {
 
+// One synthesis at a time. A request that finds the server busy waits for it (up to a limit) instead of
+// failing at once: a client that sends its next sentence the moment a stream ends would otherwise race the
+// synthesis thread clearing the flag.
+struct BusyFlag {
+    std::mutex m;
+    std::condition_variable cv;
+    bool busy = false;
+
+    bool acquire(std::chrono::milliseconds limit) {
+        std::unique_lock<std::mutex> lock(m);
+        if (!cv.wait_for(lock, limit, [&] { return !busy; })) return false;
+        busy = true;
+        return true;
+    }
+    void release() {
+        { std::lock_guard<std::mutex> lock(m); busy = false; }
+        cv.notify_one();
+    }
+};
+
 enum class StreamAudioFormat {
     Wav,
     PcmS16LE,
@@ -447,7 +467,7 @@ namespace s2
     bool Server::serve(const ServerParams& params)
     {
         httplib::Server svr;
-        auto server_busy = std::make_shared<std::atomic<bool>>(false);
+        auto server_busy = std::make_shared<BusyFlag>();
 
         auto pipeline = std::make_shared<s2::Pipeline>();
         if (!pipeline->init(params.pipeline))
@@ -459,7 +479,7 @@ namespace s2
         std::mutex active_threads_mtx;
         std::vector<std::thread> active_threads;
 
-        svr.set_pre_routing_handler([](const auto& req, auto& res) -> httplib::Server::HandlerResponse {
+        svr.set_pre_routing_handler([&params](const auto& req, auto& res) -> httplib::Server::HandlerResponse {
             auto start = std::chrono::high_resolution_clock::now();
 
             S2_LOG_INFO_STREAM("[START] " << req.method << " " << req.path << std::endl);
@@ -467,9 +487,12 @@ namespace s2
             res.set_header("X-Request-Start",
                 std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
                     start.time_since_epoch()).count()));
-            // Allow browser clients on another origin (e.g. a webview app).
-            res.set_header("Access-Control-Allow-Origin", "*");
-            res.set_header("Access-Control-Expose-Headers", "X-Audio-Sample-Rate");
+            // Browser clients on another origin, only when asked for (--cors): any page the user visits could
+            // otherwise call this server.
+            if (!params.cors_origin.empty()) {
+                res.set_header("Access-Control-Allow-Origin", params.cors_origin);
+                res.set_header("Access-Control-Expose-Headers", "X-Audio-Sample-Rate");
+            }
 
             return httplib::Server::HandlerResponse::Unhandled;
             });
@@ -717,22 +740,14 @@ namespace s2
                     }
                 }
 
-                // wait for the request before instead of refusing at once. A stream ends a moment
-                // before its thread clears the busy flag, so the next sentence, sent as soon as the last one
-                // ended, was refused. Up to 60 s, then 503 as before.
-                bool expected_idle = false;
-                for (int waited = 0; !server_busy->compare_exchange_strong(expected_idle, true); ++waited) {
-                    expected_idle = false;
-                    if (waited >= 1200 || req.is_connection_closed()) {
-                        res.status = 503;
-                        res.set_content("Server busy processing another synthesis request.", "text/plain");
-                        return;
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                if (!server_busy->acquire(std::chrono::seconds(60))) {
+                    res.status = 503;
+                    res.set_content("Server busy processing another synthesis request.", "text/plain");
+                    return;
                 }
 
                 auto release_busy = [&]() {
-                    server_busy->store(false);
+                    server_busy->release();
                 };
 
                 if (!stream_response && !segment_sentences) {
@@ -892,7 +907,7 @@ namespace s2
                         std::cerr << "Streaming synthesis failed." << std::endl;
 
                     }
-                    server_busy->store(false);
+                    server_busy->release();
                 });
                 {
                     std::lock_guard<std::mutex> lock(active_threads_mtx);
