@@ -237,9 +237,31 @@ static ggml_tensor * causal_conv_transpose_1d(ggml_context * ctx,
                                                ggml_tensor * weight, ggml_tensor * bias,
                                                ggml_tensor * x, int stride, int crop_right) {
     if (weight->type != GGML_TYPE_F32) weight = ggml_cast(ctx, weight, GGML_TYPE_F32);
-    ggml_tensor * x_lc = cl_to_lc(ctx, x);
-    if (x_lc->type != GGML_TYPE_F32) x_lc = ggml_cast(ctx, x_lc, GGML_TYPE_F32);
-    ggml_tensor * y = ggml_conv_transpose_1d(ctx, weight, x_lc, stride, 0, 1);
+    ggml_tensor * y = nullptr;
+    const int64_t K = weight->ne[0], c_out = weight->ne[1], c_in = weight->ne[2];
+    if (K % stride == 0 && x->ne[0] == c_in) {
+        // as one matrix product and an overlap-add. ggml's CUDA conv_transpose_1d took about half of a
+        // decode on a GTX 1080; this is the same sum. Input position l, tap k, output channel c lands on output
+        // sample l * stride + k: the product gives every (k, c, l), and the K / stride groups of taps are summed
+        // with a shift of one block of stride samples each.
+        const int64_t L = x->ne[1], m = K / stride;
+        ggml_tensor * w = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, weight, 1, 2, 0, 3)), c_in, K * c_out);
+        ggml_tensor * xc = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
+        if (xc->type != GGML_TYPE_F32) xc = ggml_cast(ctx, xc, GGML_TYPE_F32);
+        ggml_tensor * col = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w, xc), K, c_out, L);
+        for (int64_t j = 0; j < m; ++j) {
+            ggml_tensor * taps = ggml_view_3d(ctx, col, stride, c_out, L, col->nb[1], col->nb[2],
+                                              static_cast<size_t>(j * stride) * col->nb[0]);
+            ggml_tensor * part = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, taps, 0, 2, 1, 3)), stride * L, c_out);
+            // Padded along the first axis: CUDA's pad kernel puts the second on a grid axis capped at 65535.
+            part = ggml_pad_ext(ctx, part, static_cast<int>(j * stride), static_cast<int>((m - 1 - j) * stride), 0, 0, 0, 0, 0, 0);
+            y = y ? ggml_add(ctx, y, part) : part;
+        }
+    } else {
+        ggml_tensor * x_lc = cl_to_lc(ctx, x);
+        if (x_lc->type != GGML_TYPE_F32) x_lc = ggml_cast(ctx, x_lc, GGML_TYPE_F32);
+        y = ggml_conv_transpose_1d(ctx, weight, x_lc, stride, 0, 1);
+    }
     y = add_channel_bias_lc(ctx, y, bias);
     if (crop_right > 0) {
         y = ggml_view_2d(ctx, y, y->ne[0] - crop_right, y->ne[1], y->nb[1], 0);
