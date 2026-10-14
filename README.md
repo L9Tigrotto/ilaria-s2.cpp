@@ -39,7 +39,7 @@ Build: `S2_CUDA_GRAPHS` (CMake, default ON with CUDA) turns on ggml's CUDA graph
 
 ### Quantization
 
-**`s2-pro-q4_k_m.gguf` is not usable for voice cloning here: the voice changes from sentence to sentence**, as if each one were spoken by a different person. Use `s2-pro-q8_0.gguf`. Q4_K_M quantizes the Fast-AR (which writes the acoustic codebooks) and the codebook embeddings that carry the reference voice in. A file with only the Slow-AR layers at Q4 runs at about 40 ms/frame and is being tested.
+`s2-pro-q4_k_m.gguf` works for voice cloning on this fork. An earlier note here said the voice changed from sentence to sentence; that came from a single take. Checked since: the fork's decode steps match the general paths as closely on q4_k_m as on q8_0, and in a blind test of six q4_k_m takes (three from this fork, three from upstream) none changed voice. On a GTX 1080, generation takes about 36 ms per frame with q4_k_m and 45 with q8_0 (a frame is about 46 ms of speech).
 
 ### Credits
 
