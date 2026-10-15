@@ -3,9 +3,14 @@ namespace fs = ghc::filesystem;
 #include "s2_log.h"
 #include "s2_pipeline.h"
 #include "s2_server.h"
+#include "s2_audio.h"
+#include "s2_codec.h"
+#include "s2_voice.h"
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -95,13 +100,97 @@ void print_uso() {
     safe_print("  --batch-text       <text>   Repeatable: generate the texts side by side, <output>-<n>.wav each\n");
     safe_print("  --slots            <n>      Requests generated side by side (default 2; 1 = one at a time)\n");
     safe_print("  --stream-decode-stride <n>  Decode cadence in frames (0 = auto: server 4, file/offline 16)\n");
-    safe_print("  --codec-context-frames <n>  Override codec decode history (lower uses less VRAM, default: auto)\n");
+    safe_print("  --codec-context-frames <n>  Override codec decode history of offline decodes (streams keep state)\n");
+    safe_print("  --codec-stream-check <file> Decode a .s2voice's codes whole and streamed, print the difference\n");
     safe_print("  --log-level <level>         error, warn, info, or debug (default: info)\n");
     safe_print("  --server                    Start HTTP server\n");
     safe_print("  -H, --host         <host>   Server host (default: 127.0.0.1)\n");
     safe_print("  -P, --port         <port>   Server port (default: 3030)\n");
     safe_print("  --cors             <origin> Allow browser requests from this origin, \"*\" for any (default: none)\n");
     safe_print("  -h, --help                  Show this help\n");
+}
+
+// Decodes a voice's codes once whole, then streamed in chunks of a few sizes, and prints how far apart they are.
+// Writes <output>-whole.wav and <output>-stream<n>.wav for the ears.
+static int run_codec_stream_check(const s2::PipelineParams & params, const std::string & voice_path) {
+    const s2::VoiceProfile voice = s2::VoiceProfile::load(voice_path);
+    // The first 160 frames: more than the codec transformer's window of 128, and a whole decode of all of them fits.
+    const int32_t T = (std::min)(voice.T_prompt, 160);
+    if (T <= 0 || voice.codes.size() < static_cast<size_t>(voice.num_codebooks) * T) {
+        safe_print_error("Error: no codes in " + voice_path + "\n");
+        return 1;
+    }
+    s2::AudioCodec codec;
+    if (!codec.load(params.model_path, params.gpu_device, params.backend_type)) return 1;
+    const std::string stem = params.output_path.size() > 4 ? params.output_path.substr(0, params.output_path.size() - 4)
+                                                           : params.output_path;
+    std::vector<int32_t> codes;
+    for (int32_t cb = 0; cb < voice.num_codebooks; ++cb) {
+        const auto row = voice.codes.begin() + static_cast<size_t>(cb) * voice.T_prompt;
+        codes.insert(codes.end(), row, row + T);
+    }
+    std::vector<float> whole;
+    if (!codec.decode(codes.data(), T, params.gen.n_threads, whole)) return 1;
+    s2::audio_write_wav(stem + "-whole.wav", whole.data(), whole.size(), codec.sample_rate());
+    double energy = 0.0;
+    for (float x : whole) energy += static_cast<double>(x) * x;
+    safe_print(std::to_string(T) + " frames, " + std::to_string(whole.size()) + " samples decoded whole\n");
+    {
+        // For comparison: what a window of the old streamed decode costs (stride 32 and context 16, 48 frames).
+        std::vector<int32_t> window;
+        for (int32_t cb = 0; cb < voice.num_codebooks; ++cb) {
+            window.insert(window.end(), codes.begin() + static_cast<size_t>(cb) * T,
+                          codes.begin() + static_cast<size_t>(cb) * T + 48);
+        }
+        std::vector<float> pcm;
+        codec.decode(window.data(), 48, params.gen.n_threads, pcm);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 5; ++i) codec.decode(window.data(), 48, params.gen.n_threads, pcm);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 5;
+        safe_print("windowed decode of 48 frames: " + std::to_string(ms) + " ms\n");
+    }
+
+    int bad = 0;
+    for (int32_t chunk : { 1, 4, 8, 13, 32 }) {
+        s2::AudioCodec::Stream * stream = codec.stream_begin();
+        std::vector<float> streamed, pcm;
+        std::vector<int32_t> part;
+        double ms = 0.0, first_ms = -1.0; // the first call also builds the graph
+        for (int32_t at = 0; at < T; at += chunk) {
+            const int32_t n = (std::min)(chunk, T - at);
+            part.resize(static_cast<size_t>(voice.num_codebooks) * n);
+            for (int32_t cb = 0; cb < voice.num_codebooks; ++cb) {
+                std::copy_n(voice.codes.begin() + static_cast<size_t>(cb) * voice.T_prompt + at, n,
+                            part.begin() + static_cast<size_t>(cb) * n);
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            if (!codec.stream_decode(stream, part.data(), n, params.gen.n_threads, pcm)) {
+                safe_print_error("Error: stream decode failed\n");
+                codec.stream_end(stream);
+                return 1;
+            }
+            const double call_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (first_ms < 0.0) first_ms = call_ms; else ms += call_ms;
+            streamed.insert(streamed.end(), pcm.begin(), pcm.end());
+        }
+        codec.stream_end(stream);
+        s2::audio_write_wav(stem + "-stream" + std::to_string(chunk) + ".wav", streamed.data(), streamed.size(),
+                            codec.sample_rate());
+        double diff = 0.0, max_diff = 0.0;
+        const size_t n = (std::min)(whole.size(), streamed.size());
+        for (size_t i = 0; i < n; ++i) {
+            const double d = static_cast<double>(whole[i]) - streamed[i];
+            diff += d * d;
+            max_diff = (std::max)(max_diff, std::fabs(d));
+        }
+        const double snr = diff > 0.0 ? 10.0 * std::log10(energy / diff) : 999.0;
+        char line[200];
+        std::snprintf(line, sizeof(line), "chunk %2d: %zu samples, max diff %.2e, SNR %.1f dB, first call %.0f ms, then %.2f ms a frame\n",
+                      chunk, streamed.size(), max_diff, snr, first_ms, ms / (std::max)(1, T - chunk));
+        safe_print(line);
+        if (streamed.size() != whole.size() || snr < 60.0) bad = 1;
+    }
+    return bad;
 }
 
 int main(int argc, char** argv) {
@@ -155,6 +244,7 @@ int main(int argc, char** argv) {
     bool use_server = false;
     bool use_stream_file = false;
     bool list_voices = false;
+    std::string codec_stream_check;
     s2::ServerParams serverParams;
 
     for (int i = 1; i < argc; ++i) {
@@ -228,10 +318,15 @@ int main(int argc, char** argv) {
             }
         }
         else if (arg == "--server")           { use_server = true; }
+        else if (arg == "--codec-stream-check") { if (i+1 < argc) codec_stream_check = argv[++i]; }
         else if (arg == "-H" || arg == "--host") { if (i+1 < argc) serverParams.host = argv[++i]; }
         else if (arg == "-P" || arg == "--port") { if (i+1 < argc) { try { serverParams.port = std::stoi(argv[++i]); } catch(...) {} } }
         else if (arg == "--cors") { if (i+1 < argc) serverParams.cors_origin = argv[++i]; }
         else if (arg == "-h" || arg == "--help") { print_uso(); return 0; }
+    }
+
+    if (!codec_stream_check.empty()) {
+        return run_codec_stream_check(params, codec_stream_check);
     }
 
     if (list_voices) {

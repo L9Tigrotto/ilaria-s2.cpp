@@ -18,6 +18,7 @@
 #include <cstring>
 #include <cstdio>
 #include <limits>
+#include <memory>
 
 #include <new>
 #include <stdexcept>
@@ -59,6 +60,58 @@ struct codec_decode_cache {
     transformer_inputs inp;
     ggml_tensor * audio = nullptr;
     std::vector<int32_t> sanitized_codes;
+};
+
+// The graph of one streamed chunk of a given number of frames.
+struct stream_graph {
+    int32_t n_frames = 0;
+    std::vector<uint8_t> ctx_buf;
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * graph = nullptr;
+    ggml_gallocr_t allocr = nullptr;
+    std::vector<ggml_tensor *> code_ids;
+    transformer_inputs inp;
+    ggml_tensor * audio = nullptr;
+
+    ~stream_graph() {
+        if (allocr) ggml_gallocr_free(allocr);
+        if (ctx) ggml_free(ctx);
+    }
+};
+
+// A streamed decode. Every layer of the decoder is causal, so keeping what each one needs of the frames before
+// (the convolutions' last inputs, the transposed convolutions' overlap, the transformer's keys and values in its
+// window) makes the chunks add up to one decode of all the frames together.
+struct AudioCodec::Stream {
+    ggml_context * state_ctx = nullptr;
+    ggml_backend_buffer_t state_buf = nullptr;
+    std::vector<ggml_tensor *> states;
+    int32_t frames_done = 0;
+    std::vector<std::unique_ptr<stream_graph>> graphs; // by chunk size, newest last
+    std::vector<int32_t> sanitized_codes;
+};
+
+// While a streamed chunk's graph is built: hands each causal layer its state, in build order (made at the first
+// build), and copies the layer's new state back right after the layer has read the old one.
+struct stream_build {
+    AudioCodec::Stream & s;
+    ggml_cgraph * graph;
+    size_t next = 0;
+
+    ggml_tensor * state(int64_t ne0, int64_t ne1, int64_t ne2 = 1) {
+        if (next == s.states.size()) {
+            s.states.push_back(ggml_new_tensor_3d(s.state_ctx, GGML_TYPE_F32, ne0, ne1, ne2));
+        }
+        ggml_tensor * t = s.states[next++];
+        if (t->ne[0] != ne0 || t->ne[1] != ne1 || t->ne[2] != ne2) {
+            throw std::runtime_error("codec stream state changed shape");
+        }
+        return t;
+    }
+
+    void keep(ggml_context * ctx, ggml_tensor * tail, ggml_tensor * state) {
+        ggml_build_forward_expand(graph, ggml_cpy(ctx, tail, state));
+    }
 };
 
 struct AudioCodec::Impl {
@@ -223,9 +276,17 @@ static ggml_tensor * lc_to_cl(ggml_context * ctx, ggml_tensor * x) {
 
 static ggml_tensor * causal_conv_1d(ggml_context * ctx,
                                      ggml_tensor * weight, ggml_tensor * bias,
-                                     ggml_tensor * x, int stride, int dilation) {
+                                     ggml_tensor * x, int stride, int dilation,
+                                     stream_build * sb = nullptr) {
     const int kernel_size = static_cast<int>((weight->ne[0] - 1) * dilation + 1);
-    const int pad   = kernel_size - stride;
+    int pad = kernel_size - stride;
+    if (sb && pad > 0) {
+        // The last inputs of the chunk before stand in for the zero padding.
+        ggml_tensor * st = sb->state(x->ne[0], pad);
+        x = ggml_concat(ctx, st, x, 1);
+        sb->keep(ctx, ggml_view_2d(ctx, x, x->ne[0], pad, x->nb[1], (x->ne[1] - pad) * x->nb[1]), st);
+        pad = 0;
+    }
     const int extra = static_cast<int>(extra_padding_for_conv1d(x->ne[1], kernel_size, stride, pad));
     ggml_tensor * x_lc = cl_to_lc(ctx, x);
     x_lc = ggml_pad_ext(ctx, x_lc, pad, extra, 0, 0, 0, 0, 0, 0);
@@ -236,10 +297,14 @@ static ggml_tensor * causal_conv_1d(ggml_context * ctx,
 
 static ggml_tensor * causal_conv_transpose_1d(ggml_context * ctx,
                                                ggml_tensor * weight, ggml_tensor * bias,
-                                               ggml_tensor * x, int stride, int crop_right) {
+                                               ggml_tensor * x, int stride, int crop_right,
+                                               stream_build * sb = nullptr) {
     if (weight->type != GGML_TYPE_F32) weight = ggml_cast(ctx, weight, GGML_TYPE_F32);
     ggml_tensor * y = nullptr;
     const int64_t K = weight->ne[0], c_out = weight->ne[1], c_in = weight->ne[2];
+    if (sb && !(K % stride == 0 && x->ne[0] == c_in)) {
+        throw std::runtime_error("codec stream: transposed convolution without the matrix product path");
+    }
     if (K % stride == 0 && x->ne[0] == c_in) {
         // Computed as one matrix product and an overlap-add. ggml's CUDA conv_transpose_1d took about half of a
         // decode on a GTX 1080; this is the same sum. Input position l, tap k, output channel c lands on output
@@ -257,6 +322,16 @@ static ggml_tensor * causal_conv_transpose_1d(ggml_context * ctx,
             // Padded along the first axis: CUDA's pad kernel puts the second on a grid axis capped at 65535.
             part = ggml_pad_ext(ctx, part, static_cast<int>(j * stride), static_cast<int>((m - 1 - j) * stride), 0, 0, 0, 0, 0, 0);
             y = y ? ggml_add(ctx, y, part) : part;
+        }
+        const int64_t tail = K - stride; // samples past its own block that each input still reaches
+        if (sb && tail > 0) {
+            // The tail the chunk before reached into this one is added at the start; this chunk's tail is kept
+            // instead of cropped.
+            ggml_tensor * st = sb->state(tail, c_out);
+            y = ggml_add(ctx, y, ggml_pad_ext(ctx, st, 0, static_cast<int>(y->ne[0] - tail), 0, 0, 0, 0, 0, 0));
+            sb->keep(ctx, ggml_view_2d(ctx, y, tail, c_out, y->nb[1], (y->ne[0] - tail) * y->nb[0]), st);
+            y = ggml_cont(ctx, ggml_view_2d(ctx, y, y->ne[0] - tail, c_out, y->nb[1], 0));
+            crop_right = 0;
         }
     } else {
         ggml_tensor * x_lc = cl_to_lc(ctx, x);
@@ -313,7 +388,8 @@ static ggml_tensor * build_transformer(ggml_context * ctx, ggml_context * ctx_w,
                                         int32_t block_size, int32_t n_local_heads, int32_t head_dim,
                                         float rope_base, float norm_eps, int32_t window_size,
                                         bool force_explicit_causal_mask,
-                                        transformer_inputs & inp) {
+                                        transformer_inputs & inp,
+                                        stream_build * sb = nullptr) {
     const int32_t dim     = static_cast<int32_t>(x->ne[0]);
     const int32_t seq_len = static_cast<int32_t>(x->ne[1]);
     const int32_t n_head  = dim / head_dim;
@@ -361,6 +437,18 @@ static ggml_tensor * build_transformer(ggml_context * ctx, ggml_context * ctx_w,
         k = ggml_rope_ext(ctx, k, inp.positions, nullptr, head_dim, 0,
                           block_size, rope_base, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f);
 
+        if (sb) {
+            // Keys (with their rotation) and values of the window's frames before this chunk; the mask leaves out
+            // the ones that are not there yet or out of the window.
+            const int64_t w = window_size - 1;
+            ggml_tensor * sk = sb->state(head_dim, n_local_heads, w);
+            ggml_tensor * sv = sb->state(head_dim, n_local_heads, w);
+            k = ggml_concat(ctx, sk, k, 2);
+            v = ggml_concat(ctx, sv, v, 2);
+            sb->keep(ctx, ggml_view_3d(ctx, k, head_dim, n_local_heads, w, k->nb[1], k->nb[2], seq_len * k->nb[2]), sk);
+            sb->keep(ctx, ggml_view_3d(ctx, v, head_dim, n_local_heads, w, v->nb[1], v->nb[2], seq_len * v->nb[2]), sv);
+        }
+
         ggml_tensor * k_rep = repeat_interleave_heads(ctx, k, n_head / n_local_heads);
         ggml_tensor * v_rep = repeat_interleave_heads(ctx, v, n_head / n_local_heads);
 
@@ -400,21 +488,23 @@ static ggml_tensor * build_transformer(ggml_context * ctx, ggml_context * ctx_w,
 }
 
 static ggml_tensor * build_residual_unit(ggml_context * ctx, ggml_context * ctx_w,
-                                          const std::string & prefix, ggml_tensor * x, int dilation) {
+                                          const std::string & prefix, ggml_tensor * x, int dilation,
+                                          stream_build * sb = nullptr) {
     auto req = [&](const std::string & n) -> ggml_tensor * {
         ggml_tensor * t = ggml_get_tensor(ctx_w, n.c_str());
         if (!t) throw std::runtime_error("missing tensor: " + n);
         return t;
     };
     ggml_tensor * y = snake_activation(ctx, x, req(prefix + ".block.0.alpha"));
-    y = causal_conv_1d(ctx, req(prefix + ".block.1.conv.weight"), req(prefix + ".block.1.conv.bias"), y, 1, dilation);
+    y = causal_conv_1d(ctx, req(prefix + ".block.1.conv.weight"), req(prefix + ".block.1.conv.bias"), y, 1, dilation, sb);
     y = snake_activation(ctx, y, req(prefix + ".block.2.alpha"));
-    y = causal_conv_1d(ctx, req(prefix + ".block.3.conv.weight"), req(prefix + ".block.3.conv.bias"), y, 1, 1);
+    y = causal_conv_1d(ctx, req(prefix + ".block.3.conv.weight"), req(prefix + ".block.3.conv.bias"), y, 1, 1, sb);
     return ggml_add(ctx, x, y);
 }
 
 static ggml_tensor * build_convnext_block(ggml_context * ctx, ggml_context * ctx_w,
-                                           const std::string & prefix, ggml_tensor * x) {
+                                           const std::string & prefix, ggml_tensor * x,
+                                           stream_build * sb = nullptr) {
     auto req = [&](const std::string & n) -> ggml_tensor * {
         ggml_tensor * t = ggml_get_tensor(ctx_w, n.c_str());
         if (!t) throw std::runtime_error("missing tensor: " + n);
@@ -424,9 +514,16 @@ static ggml_tensor * build_convnext_block(ggml_context * ctx, ggml_context * ctx
     ggml_tensor * dw_w = req(prefix + ".dwconv.conv.weight");
     ggml_tensor * dw_b = req(prefix + ".dwconv.conv.bias");
     const int kernel_size_dw = static_cast<int>(dw_w->ne[0]);
-    const int pad_dw = kernel_size_dw - 1;
-    const int extra_dw = static_cast<int>(extra_padding_for_conv1d(x->ne[1], kernel_size_dw, 1, pad_dw));
-    ggml_tensor * x_lc = cl_to_lc(ctx, x);
+    int pad_dw = kernel_size_dw - 1;
+    ggml_tensor * x_in = x;
+    if (sb && pad_dw > 0) {
+        ggml_tensor * st = sb->state(x->ne[0], pad_dw);
+        x_in = ggml_concat(ctx, st, x, 1);
+        sb->keep(ctx, ggml_view_2d(ctx, x_in, x->ne[0], pad_dw, x_in->nb[1], x->ne[1] * x_in->nb[1]), st);
+        pad_dw = 0;
+    }
+    const int extra_dw = static_cast<int>(extra_padding_for_conv1d(x_in->ne[1], kernel_size_dw, 1, pad_dw));
+    ggml_tensor * x_lc = cl_to_lc(ctx, x_in);
     x_lc = ggml_pad_ext(ctx, x_lc, pad_dw, extra_dw, 0, 0, 0, 0, 0, 0);
     ggml_tensor * y_lc = ggml_conv_1d_dw(ctx, dw_w, x_lc, 1, 0, 1);
     y_lc = add_channel_bias_lc(ctx, y_lc, dw_b);
@@ -470,19 +567,21 @@ static ggml_tensor * build_encoder_block(ggml_context * ctx, AudioCodec::Impl & 
 }
 
 static ggml_tensor * build_quantizer_stage_up(ggml_context * ctx, AudioCodec::Impl & impl,
-                                               const std::string & prefix, ggml_tensor * x, int factor) {
+                                               const std::string & prefix, ggml_tensor * x, int factor,
+                                               stream_build * sb = nullptr) {
     auto req = [&](const std::string & n) -> ggml_tensor * {
         ggml_tensor * t = ggml_get_tensor(impl.ctx_w, n.c_str());
         if (!t) throw std::runtime_error("missing tensor: " + n);
         return t;
     };
-    x = causal_conv_transpose_1d(ctx, req(prefix + ".0.conv.weight"), req(prefix + ".0.conv.bias"), x, factor, 0);
-    x = build_convnext_block(ctx, impl.ctx_w, prefix + ".1", x);
+    x = causal_conv_transpose_1d(ctx, req(prefix + ".0.conv.weight"), req(prefix + ".0.conv.bias"), x, factor, 0, sb);
+    x = build_convnext_block(ctx, impl.ctx_w, prefix + ".1", x, sb);
     return x;
 }
 
 static ggml_tensor * build_quantizer_decode_stage(ggml_context * ctx, AudioCodec::Impl & impl,
-                                                   ggml_tensor * z, transformer_inputs & inp) {
+                                                   ggml_tensor * z, transformer_inputs & inp,
+                                                   stream_build * sb = nullptr) {
     ggml_tensor * x = build_transformer(ctx, impl.ctx_w, impl.tprefix + "quantizer.post_module", z,
                                          impl.rvq_transformer_block_size,
                                          impl.rvq_transformer_n_local_heads,
@@ -491,17 +590,18 @@ static ggml_tensor * build_quantizer_decode_stage(ggml_context * ctx, AudioCodec
                                          impl.rvq_transformer_norm_eps,
                                          impl.rvq_transformer_window_size,
                                          backend_requires_explicit_causal_mask(impl.backend),
-                                         inp);
+                                         inp, sb);
     const size_t n = impl.quantizer_downsample_factor.size();
     for (size_t i = 0; i < n; ++i) {
         int factor = impl.quantizer_downsample_factor[n - 1 - i];
-        x = build_quantizer_stage_up(ctx, impl, impl.tprefix + "quantizer.upsample." + std::to_string(i), x, factor);
+        x = build_quantizer_stage_up(ctx, impl, impl.tprefix + "quantizer.upsample." + std::to_string(i), x, factor, sb);
     }
     return x;
 }
 
 static ggml_tensor * build_decoder_block(ggml_context * ctx, AudioCodec::Impl & impl,
-                                          const std::string & prefix, ggml_tensor * x, int stride) {
+                                          const std::string & prefix, ggml_tensor * x, int stride,
+                                          stream_build * sb = nullptr) {
     auto req = [&](const std::string & n) -> ggml_tensor * {
         ggml_tensor * t = ggml_get_tensor(impl.ctx_w, n.c_str());
         if (!t) throw std::runtime_error("missing tensor: " + n);
@@ -510,14 +610,15 @@ static ggml_tensor * build_decoder_block(ggml_context * ctx, AudioCodec::Impl & 
     x = snake_activation(ctx, x, req(prefix + ".block.0.alpha"));
     x = causal_conv_transpose_1d(ctx, req(prefix + ".block.1.conv.weight"),
                                        req(prefix + ".block.1.conv.bias"),
-                                       x, stride, stride);
-    x = build_residual_unit(ctx, impl.ctx_w, prefix + ".block.2", x, 1);
-    x = build_residual_unit(ctx, impl.ctx_w, prefix + ".block.3", x, 3);
-    x = build_residual_unit(ctx, impl.ctx_w, prefix + ".block.4", x, 9);
+                                       x, stride, stride, sb);
+    x = build_residual_unit(ctx, impl.ctx_w, prefix + ".block.2", x, 1, sb);
+    x = build_residual_unit(ctx, impl.ctx_w, prefix + ".block.3", x, 3, sb);
+    x = build_residual_unit(ctx, impl.ctx_w, prefix + ".block.4", x, 9, sb);
     return x;
 }
 
-static ggml_tensor * build_decoder(ggml_context * ctx, AudioCodec::Impl & impl, ggml_tensor * z) {
+static ggml_tensor * build_decoder(ggml_context * ctx, AudioCodec::Impl & impl, ggml_tensor * z,
+                                   stream_build * sb = nullptr) {
     auto req = [&](const std::string & n) -> ggml_tensor * {
         ggml_tensor * t = ggml_get_tensor(impl.ctx_w, n.c_str());
         if (!t) throw std::runtime_error("missing tensor: " + n);
@@ -527,12 +628,12 @@ static ggml_tensor * build_decoder(ggml_context * ctx, AudioCodec::Impl & impl, 
     ggml_tensor * x = causal_conv_1d(ctx,
         req(impl.tprefix + "decoder.model.0.conv.weight"),
         req(impl.tprefix + "decoder.model.0.conv.bias"),
-        z, 1, 1);
+        z, 1, 1, sb);
 
     for (size_t i = 0; i < impl.decoder_rates.size(); ++i) {
         x = build_decoder_block(ctx, impl,
                                  impl.tprefix + "decoder.model." + std::to_string(i + 1),
-                                 x, impl.decoder_rates[i]);
+                                 x, impl.decoder_rates[i], sb);
     }
 
     const int last_idx = static_cast<int>(impl.decoder_rates.size()) + 1;
@@ -540,7 +641,7 @@ static ggml_tensor * build_decoder(ggml_context * ctx, AudioCodec::Impl & impl, 
     x = causal_conv_1d(ctx,
         req(impl.tprefix + "decoder.model." + std::to_string(last_idx + 1) + ".conv.weight"),
         req(impl.tprefix + "decoder.model." + std::to_string(last_idx + 1) + ".conv.bias"),
-        x, 1, 1);
+        x, 1, 1, sb);
     return ggml_tanh(ctx, x);
 }
 
@@ -1466,6 +1567,115 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
     ggml_gallocr_free(allocr);
     ggml_free(ctx);
     
+    return true;
+}
+
+static bool build_stream_graph(AudioCodec::Impl & impl, AudioCodec::Stream & s, stream_graph & g, int32_t n_frames) {
+    const size_t n_nodes = 16384;
+    g.n_frames = n_frames;
+    g.ctx_buf.resize(ggml_tensor_overhead() * n_nodes + ggml_graph_overhead_custom(n_nodes, false));
+    ggml_init_params p = { g.ctx_buf.size(), g.ctx_buf.data(), true };
+    g.ctx = ggml_init(p);
+    if (!g.ctx) return false;
+    g.graph = ggml_new_graph_custom(g.ctx, n_nodes, false);
+
+    const int32_t num_codebooks = impl.quantizer_residual_codebooks + 1;
+    for (int32_t cb = 0; cb < num_codebooks; ++cb) {
+        g.code_ids.push_back(ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, n_frames));
+    }
+    // Set at each call: the frames' positions in the stream, and which keys of the window each one sees.
+    const int32_t w = impl.rvq_transformer_window_size - 1;
+    g.inp.positions = ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, n_frames);
+    g.inp.mask = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, w + n_frames, n_frames);
+    g.inp.position_values.resize(static_cast<size_t>(n_frames));
+    g.inp.mask_values.resize(static_cast<size_t>(w + n_frames) * n_frames);
+
+    stream_build sb{ s, g.graph };
+    try {
+        ggml_tensor * stage = build_decode_codes_stage_backend(g.ctx, impl, g.code_ids);
+        ggml_tensor * latent = build_quantizer_decode_stage(g.ctx, impl, stage, g.inp, &sb);
+        ggml_tensor * audio = build_decoder(g.ctx, impl, latent, &sb);
+        g.audio = ggml_cpy(g.ctx, audio, ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, audio->ne[0], audio->ne[1]));
+    } catch (const std::exception & e) {
+        std::cerr << "[Codec::stream] graph build failed: " << e.what() << std::endl;
+        return false;
+    }
+    if (sb.next != s.states.size()) return false;
+    ggml_build_forward_expand(g.graph, g.audio);
+
+    if (!s.state_buf) {
+        s.state_buf = ggml_backend_alloc_ctx_tensors(s.state_ctx, impl.backend);
+        if (!s.state_buf) return false;
+        ggml_backend_buffer_clear(s.state_buf, 0); // zeros: the padding before the first frame
+    }
+    g.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(impl.backend));
+    return g.allocr && ggml_gallocr_alloc_graph(g.allocr, g.graph);
+}
+
+AudioCodec::Stream * AudioCodec::stream_begin() {
+    if (!impl_ || impl_->rvq_transformer_window_size < 1) return nullptr;
+    Stream * s = new Stream();
+    ggml_init_params p = { 256 * ggml_tensor_overhead(), nullptr, true };
+    s->state_ctx = ggml_init(p);
+    return s;
+}
+
+void AudioCodec::stream_end(Stream * s) {
+    if (!s) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    s->graphs.clear();
+    if (s->state_buf) ggml_backend_buffer_free(s->state_buf);
+    if (s->state_ctx) ggml_free(s->state_ctx);
+    delete s;
+}
+
+bool AudioCodec::stream_decode(Stream * s, const int32_t * codes, int32_t n_frames, int32_t n_threads,
+                               std::vector<float> & audio_out) {
+    if (!s || n_frames <= 0 || !impl_ || !impl_->backend) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    Impl & impl = *impl_;
+
+    stream_graph * g = nullptr;
+    for (auto & c : s->graphs) if (c->n_frames == n_frames) g = c.get();
+    if (!g) {
+        // ponytail: a few graphs a stream; usually one chunk size, plus the last chunk and catching up.
+        if (s->graphs.size() >= 3) s->graphs.erase(s->graphs.begin());
+        s->graphs.push_back(std::make_unique<stream_graph>());
+        g = s->graphs.back().get();
+        if (!build_stream_graph(impl, *s, *g, n_frames)) {
+            s->graphs.pop_back();
+            return false;
+        }
+    }
+
+    sanitize_decode_codes(impl, codes, n_frames, s->sanitized_codes);
+    const int32_t num_codebooks = impl.quantizer_residual_codebooks + 1;
+    for (int32_t cb = 0; cb < num_codebooks; ++cb) {
+        ggml_backend_tensor_set(g->code_ids[static_cast<size_t>(cb)],
+                                s->sanitized_codes.data() + static_cast<size_t>(cb) * n_frames, 0,
+                                static_cast<size_t>(n_frames) * sizeof(int32_t));
+    }
+    // Key j is the frame at frames_done - w + j: the w kept before the chunk, then the chunk's own.
+    const int32_t window = impl.rvq_transformer_window_size, w = window - 1, n_keys = w + n_frames;
+    for (int32_t q = 0; q < n_frames; ++q) {
+        const int32_t pos = s->frames_done + q;
+        g->inp.position_values[static_cast<size_t>(q)] = pos;
+        for (int32_t j = 0; j < n_keys; ++j) {
+            const int32_t key = s->frames_done - w + j;
+            g->inp.mask_values[static_cast<size_t>(q) * n_keys + j] =
+                (key >= 0 && key <= pos && key > pos - window) ? 0.0f : -1e9f;
+        }
+    }
+    ggml_backend_tensor_set(g->inp.positions, g->inp.position_values.data(), 0,
+                            g->inp.position_values.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(g->inp.mask, g->inp.mask_values.data(), 0, g->inp.mask_values.size() * sizeof(float));
+
+    if (ggml_backend_is_cpu(impl.backend)) ggml_backend_cpu_set_n_threads(impl.backend, n_threads);
+    if (ggml_backend_graph_compute(impl.backend, g->graph) != GGML_STATUS_SUCCESS) return false;
+
+    audio_out.resize(static_cast<size_t>(ggml_nelements(g->audio)));
+    ggml_backend_tensor_get(g->audio, audio_out.data(), 0, audio_out.size() * sizeof(float));
+    s->frames_done += n_frames;
     return true;
 }
 
