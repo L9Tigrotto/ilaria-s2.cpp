@@ -56,6 +56,7 @@ GenerateResult generate(
     sparams.temperature     = params.temperature;
     sparams.top_p           = params.top_p;
     sparams.top_k           = params.top_k;
+    std::mt19937 gen(params.seed >= 0 ? static_cast<uint32_t>(params.seed) : std::random_device{}());
 
     // Entry i of state.logits is semantic token sem_begin + i; an entry past them is the end token.
     auto sample_main = [&](const SamplerParams & sp, bool block_im_end) -> int32_t {
@@ -65,7 +66,7 @@ GenerateResult generate(
         if (block_im_end && end_idx >= 0) {
             biased[end_idx] = -std::numeric_limits<float>::infinity();
         }
-        const int32_t idx = sample_token(biased.data(), (int32_t)biased.size(), sp);
+        const int32_t idx = sample_token(biased.data(), (int32_t)biased.size(), sp, gen);
         return idx < n_sem ? sem_begin + idx : im_end_id;
     };
 
@@ -124,7 +125,7 @@ GenerateResult generate(
                 }
                 break;
             }
-            int32_t cb_token = sample_token(fast_logits.data(), (int32_t)fast_logits.size(), sparams);
+            int32_t cb_token = sample_token(fast_logits.data(), (int32_t)fast_logits.size(), sparams, gen);
             codebooks_cb.push_back(cb_token);
         }
 

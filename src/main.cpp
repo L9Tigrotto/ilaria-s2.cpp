@@ -81,6 +81,7 @@ void print_uso() {
     safe_print("  -temp, --temp, --temperature <f>  Temperature\n");
     safe_print("  -top-p, --top-p    <f>      Top-p sampling\n");
     safe_print("  -top-k, --top-k    <n>      Top-k sampling\n");
+    safe_print("  --seed             <n>      Sampler seed (-1 = random)\n");
     safe_print("  --dynamic-normalize         Apply dynamic RMS normalization\n");
     safe_print("  --no-dynamic-normalize      Disable dynamic RMS normalization\n");
     safe_print("  --no-trim-silence           Keep trailing silence in output WAV\n");
@@ -187,6 +188,7 @@ int main(int argc, char** argv) {
         else if (arg == "-temp" || arg == "--temp" || arg == "--temperature") { if (i+1 < argc) { try { params.gen.temperature = std::stof(argv[++i]); } catch(...) {} } }
         else if (arg == "-top-p" || arg == "--top-p")      { if (i+1 < argc) { try { params.gen.top_p       = std::stof(argv[++i]); } catch(...) {} } }
         else if (arg == "-top-k" || arg == "--top-k")      { if (i+1 < argc) { try { params.gen.top_k       = std::stoi(argv[++i]); } catch(...) {} } }
+        else if (arg == "--seed")                          { if (i+1 < argc) { try { params.gen.seed        = std::stoi(argv[++i]); } catch(...) {} } }
         else if (arg == "--dynamic-normalize")     { params.normalize_dynamic = true;  }
         else if (arg == "--no-dynamic-normalize")  { params.normalize_dynamic = false; }
         else if (arg == "--no-trim-silence")  { params.trim_silence     = false; }
