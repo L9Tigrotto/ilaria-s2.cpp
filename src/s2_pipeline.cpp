@@ -1073,42 +1073,58 @@ bool Pipeline::synthesize_streaming_prompt_codes_impl(const PipelineParams & par
     // codes codebook by codebook), what it streamed (<n>-stream.wav) and its text, for --decode-codes.
     const char * dump_dir = std::getenv("S2_DUMP_DIR");
     std::vector<float> dumped_pcm;
-    auto decode_and_emit = [&](const std::vector<std::vector<int32_t>> & codes_by_cb, int32_t total_frames) -> bool {
+    // The last 20 ms of each piece wait for the next one, and the final piece fades them out: the model sometimes
+    // ends a sentence while she still sounds, and a cut from there to silence clicks.
+    const size_t fade_samples = static_cast<size_t>(sample_rate / 50);
+    std::vector<float> held;
+    auto decode_and_emit = [&](const std::vector<std::vector<int32_t>> & codes_by_cb, int32_t total_frames,
+                               bool finalize) -> bool {
         const int32_t n = total_frames - committed_frames;
-        if (n <= 0) {
+        if (n <= 0 && !finalize) {
             return true;
         }
 
-        decode_codes.resize(static_cast<size_t>(num_codebooks) * n);
-        for (int32_t cb = 0; cb < num_codebooks; ++cb) {
-            if (static_cast<int32_t>(codes_by_cb[cb].size()) < total_frames) {
-                safe_print_error_ln("Pipeline streaming: internal codebook accumulation underflow.");
-                sink.on_error("Internal streaming codebook accumulation error");
+        std::vector<float> pcm;
+        if (n > 0) {
+            decode_codes.resize(static_cast<size_t>(num_codebooks) * n);
+            for (int32_t cb = 0; cb < num_codebooks; ++cb) {
+                if (static_cast<int32_t>(codes_by_cb[cb].size()) < total_frames) {
+                    safe_print_error_ln("Pipeline streaming: internal codebook accumulation underflow.");
+                    sink.on_error("Internal streaming codebook accumulation error");
+                    stream_failed = true;
+                    return false;
+                }
+                std::copy(
+                    codes_by_cb[cb].begin() + committed_frames,
+                    codes_by_cb[cb].begin() + total_frames,
+                    decode_codes.begin() + static_cast<size_t>(cb) * n
+                );
+            }
+
+            const auto decode_t0 = std::chrono::steady_clock::now();
+            if (!codec().stream_decode(codec_stream.get(), decode_codes.data(), n, params.gen.n_threads, pcm)) {
+                safe_print_error_ln("Pipeline streaming: decode failed at frame batch ending " +
+                                    std::to_string(total_frames - 1));
+                sink.on_error("Codec decode failed");
                 stream_failed = true;
                 return false;
             }
-            std::copy(
-                codes_by_cb[cb].begin() + committed_frames,
-                codes_by_cb[cb].begin() + total_frames,
-                decode_codes.begin() + static_cast<size_t>(cb) * n
-            );
+            const auto decode_t1 = std::chrono::steady_clock::now();
+            stream_decode_ms += std::chrono::duration<double, std::milli>(decode_t1 - decode_t0).count();
+            stream_decode_batches++;
         }
 
-        std::vector<float> pcm;
-        const auto decode_t0 = std::chrono::steady_clock::now();
-        if (!codec().stream_decode(codec_stream.get(), decode_codes.data(), n, params.gen.n_threads, pcm)) {
-            safe_print_error_ln("Pipeline streaming: decode failed at frame batch ending " +
-                                std::to_string(total_frames - 1));
-            sink.on_error("Codec decode failed");
-            stream_failed = true;
-            return false;
+        pcm.insert(pcm.begin(), held.begin(), held.end());
+        held.clear();
+        if (finalize) {
+            const size_t f = (std::min)(fade_samples, pcm.size());
+            for (size_t i = 0; i < f; ++i) pcm[pcm.size() - 1 - i] *= static_cast<float>(i) / static_cast<float>(f);
+        } else {
+            held.assign(pcm.end() - static_cast<std::ptrdiff_t>((std::min)(fade_samples, pcm.size())), pcm.end());
+            pcm.resize(pcm.size() - held.size());
         }
-        const auto decode_t1 = std::chrono::steady_clock::now();
-        stream_decode_ms += std::chrono::duration<double, std::milli>(decode_t1 - decode_t0).count();
-        stream_decode_batches++;
-
         if (dump_dir) dumped_pcm.insert(dumped_pcm.end(), pcm.begin(), pcm.end());
-        if (!sink.on_pcm_data(pcm.data(), pcm.size())) {
+        if (!pcm.empty() && !sink.on_pcm_data(pcm.data(), pcm.size())) {
             stream_aborted = true;
             return false;
         }
@@ -1138,7 +1154,7 @@ bool Pipeline::synthesize_streaming_prompt_codes_impl(const PipelineParams & par
                 j = std::move(*job);
                 job.reset();
             }
-            if (!decode_and_emit(j.codes, j.total_frames) || j.finalize) return;
+            if (!decode_and_emit(j.codes, j.total_frames, j.finalize) || j.finalize) return;
         }
     });
     auto submit = [&](int32_t total_frames, bool finalize) {
