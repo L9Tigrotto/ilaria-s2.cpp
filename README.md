@@ -20,7 +20,7 @@ A fork of [rodrigomatta/s2.cpp](https://github.com/rodrigomatta/s2.cpp) that mak
 | Pascal Q8_0 matrix-vector patch (see Build) | ~45 | |
 | Two requests side by side (see Batching) | 47 per step, two frames | **1.4x**\* |
 
-\\* Not the same measure as the rows above: a streamed scene of six sentences, two asked at once. One request alone stays about 0.8x.
+\* Not the same measure as the rows above: a streamed scene of six sentences, two asked at once. One request alone stays about 0.8x.
 
 Measured on a GTX 1080 8 GB, Windows 11, CUDA 12.9, `s2-pro-q8_0.gguf`, all layers and the codec on the GPU (`--codec-follow-backend`), warm HTTP server, cloned voice, 21 sentences of 2 to 6 s. Real time is seconds of audio per second of request, prefill and codec included; a frame is 46 ms of audio. Generation is now memory-bandwidth bound: Q8_0 matrix-vector products take about 40 ms of each frame.
 
