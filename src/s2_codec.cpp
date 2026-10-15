@@ -18,6 +18,7 @@
 #include <cstring>
 #include <cstdio>
 #include <limits>
+
 #include <new>
 #include <stdexcept>
 
@@ -708,6 +709,7 @@ const char * AudioCodec::backend_name() const {
 
 void AudioCodec::clear_decode_cache() {
     if (impl_) {
+        std::lock_guard<std::mutex> lock(mutex_);
         reset_decode_cache(impl_->decode_cache, false);
     }
 }
@@ -1001,7 +1003,7 @@ ggml_context * AudioCodec::weights_ctx() const {
 
 bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_threads,
                          std::vector<int32_t> & codes_out, int32_t & n_frames_out) {
-
+    std::lock_guard<std::mutex> lock(mutex_);
     const int32_t frame_length = (impl_->frame_length > 0) ? impl_->frame_length : 512;
     const int32_t padded = ((n_samples + frame_length - 1) / frame_length) * frame_length;
     std::vector<float> audio_padded(padded, 0.0f);
@@ -1320,6 +1322,7 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
                          std::vector<float> & audio_out) {
     if (n_frames <= 0) return false;
     if (!impl_ || !impl_->backend) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
 
     if (!ggml_backend_is_cpu(impl_->backend) &&
         run_cached_decode_graph(*impl_, codes, n_frames, n_threads, audio_out)) {

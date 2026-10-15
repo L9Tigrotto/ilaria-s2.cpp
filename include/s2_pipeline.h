@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <string>
+#include <memory>
 #include <mutex>
 
 namespace s2 {
@@ -47,6 +48,7 @@ struct PipelineParams {
     bool save_voice = false;
     std::string voice_storage_dir = "./voices";
     std::vector<std::string> batch_texts; // synthesize_batch: generated side by side, one file each
+    int32_t n_slots = 2;                  // requests generated side by side (each slot holds its own KV cache)
 };
 
 class Pipeline {
@@ -96,10 +98,10 @@ private:
                                    int32_t T_prompt,
                                    const std::string & transcript,
                                    const PipelineParams & params);
-    bool synthesize_prompt_codes_locked(const PipelineParams & params, const int32_t* ref_codes,
+    bool synthesize_prompt_codes_impl(const PipelineParams & params, const int32_t* ref_codes,
                                         int32_t T_prompt, std::vector<float> & audio_out,
                                         double ref_encode_ms);
-    bool synthesize_streaming_prompt_codes_locked(const PipelineParams & params, const int32_t* ref_codes,
+    bool synthesize_streaming_prompt_codes_impl(const PipelineParams & params, const int32_t* ref_codes,
                                                   int32_t T_prompt, StreamingSink & sink,
                                                   double ref_encode_ms);
 
@@ -110,6 +112,7 @@ private:
     Tokenizer* tokenizer_ref_ = &owned_tokenizer_;
     SlowARModel* model_ref_ = &owned_model_;
     AudioCodec* codec_ref_ = &owned_codec_;
+    std::unique_ptr<Engine> engine_; // the only user of the model once made; ends before it
     mutable std::mutex synthesize_mutex_;
     bool initialized_ = false;
 };

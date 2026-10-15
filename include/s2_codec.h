@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <string>
+#include <mutex>
 #include <vector>
 
 #include "s2_model.h"
@@ -49,6 +50,7 @@ public:
     Impl * impl_ = nullptr;
 
 private:
+    std::mutex mutex_; // one encode, decode or cache reset at a time: requests run side by side
 
     int32_t sample_rate_    = 44100;
     int32_t hop_length_     = 512;

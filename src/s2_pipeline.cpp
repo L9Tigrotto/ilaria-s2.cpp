@@ -519,6 +519,7 @@ bool Pipeline::init(const PipelineParams & params) {
     const auto codec_t1 = std::chrono::steady_clock::now();
 
     sync_tokenizer_config_from_model(tokenizer(), model());
+    engine_ = std::make_unique<Engine>(model(), tokenizer().config(), params.n_slots);
 
     initialized_ = true;
     const auto init_t1 = std::chrono::steady_clock::now();
@@ -546,6 +547,7 @@ bool Pipeline::init_from_components(Tokenizer* tokenizer, SlowARModel* model, Au
     model_ref_ = model;
     codec_ref_ = codec;
     sync_tokenizer_config_from_model(*tokenizer, *model);
+    engine_ = std::make_unique<Engine>(*model, tokenizer->config(), PipelineParams{}.n_slots);
     initialized_ = true;
     return true;
 }
@@ -684,7 +686,7 @@ bool Pipeline::synthesize(const PipelineParams & params) {
 }
 
 bool Pipeline::synthesize_batch(const PipelineParams & params) {
-    std::lock_guard<std::mutex> lock(synthesize_mutex_);
+    std::unique_lock<std::mutex> lock(synthesize_mutex_);
     if (!initialized_) {
         safe_print_error_ln("Pipeline not initialized.");
         return false;
@@ -703,25 +705,24 @@ bool Pipeline::synthesize_batch(const PipelineParams & params) {
     if (!resolve_reference_prompt_locked(params, ref_audio, ref_codes, T_prompt, prompt_text, ref_encode_ms)) {
         return false;
     }
+    lock.unlock();
 
     CodecDecodeCacheScope codec_decode_cache_scope(codec());
     const int32_t num_codebooks = model().hparams().num_codebooks;
     std::vector<PromptTensor> prompts;
-    int32_t max_seq_len = 0;
     for (const std::string & text : params.batch_texts) {
         prompts.push_back(build_prompt(tokenizer(), text, prompt_text,
                                        ref_codes.empty() ? nullptr : ref_codes.data(), num_codebooks, T_prompt));
-        max_seq_len = std::max(max_seq_len, prompts.back().cols + params.gen.max_new_tokens);
     }
-    if (!model().init_kv_cache(max_seq_len, n_seq)) {
-        safe_print_error_ln("Pipeline error: init_kv_cache failed.");
-        return false;
-    }
-    std::vector<const PromptTensor *> prompt_ptrs;
-    for (const PromptTensor & p : prompts) prompt_ptrs.push_back(&p);
 
+    // One request per text, all at once: the engine generates them side by side as its slots allow.
     const auto gen_t0 = std::chrono::steady_clock::now();
-    std::vector<GenerateResult> res = generate_batch(model(), tokenizer().config(), prompt_ptrs, params.gen);
+    std::vector<GenerateResult> res(n_seq);
+    std::vector<std::thread> requests;
+    for (int32_t i = 0; i < n_seq; ++i) {
+        requests.emplace_back([&, i] { res[i] = engine_->run(prompts[i], params.gen); });
+    }
+    for (std::thread & t : requests) t.join();
     const auto gen_t1 = std::chrono::steady_clock::now();
 
     // One file per text: <output>-<n>.wav.
@@ -851,7 +852,7 @@ bool Pipeline::encode_prompt_audio_data(const AudioData & ref_audio, int32_t n_t
 }
 
 bool Pipeline::synthesize_raw(const PipelineParams & params, AudioData & ref_audio, std::vector<float>& audio_out) {
-    std::lock_guard<std::mutex> lock(synthesize_mutex_);
+    std::unique_lock<std::mutex> lock(synthesize_mutex_);
     std::vector<int32_t> ref_codes;
     int32_t T_prompt = 0;
     double ref_encode_ms = 0.0;
@@ -870,7 +871,9 @@ bool Pipeline::synthesize_raw(const PipelineParams & params, AudioData & ref_aud
     PipelineParams effective_params = params;
     effective_params.prompt_text = std::move(effective_prompt_text);
 
-    return synthesize_prompt_codes_locked(
+    lock.unlock(); // the engine and the codec take turns themselves
+
+    return synthesize_prompt_codes_impl(
         effective_params,
         ref_codes.empty() ? nullptr : ref_codes.data(),
         T_prompt,
@@ -880,8 +883,7 @@ bool Pipeline::synthesize_raw(const PipelineParams & params, AudioData & ref_aud
 
 bool Pipeline::synthesize_with_prompt_codes(const PipelineParams & params, const int32_t* ref_codes,
                                             int32_t T_prompt, std::vector<float> & audio_out) {
-    std::lock_guard<std::mutex> lock(synthesize_mutex_);
-    return synthesize_prompt_codes_locked(params, ref_codes, T_prompt, audio_out, 0.0);
+    return synthesize_prompt_codes_impl(params, ref_codes, T_prompt, audio_out, 0.0);
 }
 
 bool Pipeline::resolve_prompt_reference(const PipelineParams & params, AudioData & ref_audio,
@@ -896,7 +898,7 @@ bool Pipeline::resolve_prompt_reference(const PipelineParams & params, AudioData
                                            effective_prompt_text, ref_encode_ms);
 }
 
-bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, const int32_t* ref_codes,
+bool Pipeline::synthesize_prompt_codes_impl(const PipelineParams & params, const int32_t* ref_codes,
                                               int32_t T_prompt, std::vector<float> & audio_out,
                                               double ref_encode_ms) {
     const auto synth_t0 = std::chrono::steady_clock::now();
@@ -918,16 +920,8 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
         ref_codes,
         num_codebooks, T_prompt);
 
-    int32_t max_seq_len = prompt.cols + params.gen.max_new_tokens;
-    const auto kv_t0 = std::chrono::steady_clock::now();
-    if (!model().init_kv_cache(max_seq_len)) {
-        safe_print_error_ln("Pipeline error: init_kv_cache failed.");
-        return false;
-    }
-    const auto kv_t1 = std::chrono::steady_clock::now();
-
     const auto gen_t0 = std::chrono::steady_clock::now();
-    GenerateResult res = generate(model(), tokenizer().config(), prompt, params.gen);
+    GenerateResult res = engine_->run(prompt, params.gen);
     const auto gen_t1 = std::chrono::steady_clock::now();
 
     if (res.n_frames == 0) {
@@ -951,7 +945,6 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
 
     const auto synth_t1 = std::chrono::steady_clock::now();
 
-    const double kv_ms = std::chrono::duration<double, std::milli>(kv_t1 - kv_t0).count();
     const double gen_ms = std::chrono::duration<double, std::milli>(gen_t1 - gen_t0).count();
     const double decode_wall_ms = std::chrono::duration<double, std::milli>(decode_t1 - decode_t0).count();
     const double total_ms = std::chrono::duration<double, std::milli>(synth_t1 - synth_t0).count();
@@ -967,7 +960,6 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
         "[Metrics] Synthesis: frames=" + std::to_string(res.n_frames) +
         ", audio_s=" + std::to_string(audio_seconds) +
         ", ref_encode=" + std::to_string(ref_encode_ms) +
-        " ms, kv_init=" + std::to_string(kv_ms) +
         " ms, generate=" + std::to_string(gen_ms) +
         " ms, decode=" + std::to_string(decode_ms) +
         " ms, decode_wall=" + std::to_string(decode_wall_ms) +
@@ -984,7 +976,7 @@ bool Pipeline::synthesize_prompt_codes_locked(const PipelineParams & params, con
 
 bool Pipeline::synthesize_streaming_raw(const PipelineParams & params, AudioData & ref_audio,
                                         StreamingSink & sink) {
-    std::lock_guard<std::mutex> lock(synthesize_mutex_);
+    std::unique_lock<std::mutex> lock(synthesize_mutex_);
     std::vector<int32_t> ref_codes;
     int32_t T_prompt = 0;
     double ref_encode_ms = 0.0;
@@ -1005,7 +997,9 @@ bool Pipeline::synthesize_streaming_raw(const PipelineParams & params, AudioData
     PipelineParams effective_params = params;
     effective_params.prompt_text = std::move(effective_prompt_text);
 
-    return synthesize_streaming_prompt_codes_locked(
+    lock.unlock(); // the engine and the codec take turns themselves
+
+    return synthesize_streaming_prompt_codes_impl(
         effective_params,
         ref_codes.empty() ? nullptr : ref_codes.data(),
         T_prompt,
@@ -1017,11 +1011,10 @@ bool Pipeline::synthesize_streaming_with_prompt_codes(const PipelineParams & par
                                                       const int32_t* ref_codes,
                                                       int32_t T_prompt,
                                                       StreamingSink & sink) {
-    std::lock_guard<std::mutex> lock(synthesize_mutex_);
-    return synthesize_streaming_prompt_codes_locked(params, ref_codes, T_prompt, sink, 0.0);
+    return synthesize_streaming_prompt_codes_impl(params, ref_codes, T_prompt, sink, 0.0);
 }
 
-bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & params,
+bool Pipeline::synthesize_streaming_prompt_codes_impl(const PipelineParams & params,
                                                         const int32_t* ref_codes,
                                                         int32_t T_prompt,
                                                         StreamingSink & sink,
@@ -1045,7 +1038,6 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
     uint8_t wav_header[44];
     audio_write_streaming_wav_header(wav_header, sample_rate, 1, 16);
     if (!sink.on_header(wav_header, 44)) {
-        model().clear_kv_cache();
         return false;
     }
 
@@ -1054,15 +1046,6 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
         ref_codes,
         num_codebooks, T_prompt);
 
-    int32_t max_seq_len = prompt.cols + params.gen.max_new_tokens;
-    const auto kv_t0 = std::chrono::steady_clock::now();
-    if (!model().init_kv_cache(max_seq_len)) {
-        safe_print_error_ln("Pipeline error: init_kv_cache failed.");
-        sink.on_error("init_kv_cache failed");
-        model().clear_kv_cache();
-        return false;
-    }
-    const auto kv_t1 = std::chrono::steady_clock::now();
 
     std::vector<std::vector<int32_t>> accumulated_codes_by_cb(num_codebooks);
     for (auto & row : accumulated_codes_by_cb) {
@@ -1231,32 +1214,24 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
     };
 
     const auto gen_t0 = std::chrono::steady_clock::now();
-    GenerateResult res = generate(model(), tokenizer().config(), prompt, gen_params);
+    GenerateResult res = engine_->run(prompt, gen_params);
     const auto gen_t1 = std::chrono::steady_clock::now();
     if (res.n_frames > 0 && !stream_failed && !stream_aborted) submit(res.n_frames, true);
     stop_decoder();
 
     if (res.n_frames == 0) {
-        if (stream_aborted) {
-            model().clear_kv_cache();
-            return false;
-        }
+        if (stream_aborted) return false;
         safe_print_error_ln("Pipeline error: generation produced no frames.");
         sink.on_error("Generation produced no frames");
-        model().clear_kv_cache();
         return false;
     }
 
-    if (stream_failed || stream_aborted) {
-        model().clear_kv_cache();
-        return false;
-    }
+    if (stream_failed || stream_aborted) return false;
 
     sink.on_done();
     safe_print_ln("Streaming synthesis complete: " + std::to_string(res.n_frames) + " frames");
     const auto synth_t1 = std::chrono::steady_clock::now();
 
-    const double kv_ms = std::chrono::duration<double, std::milli>(kv_t1 - kv_t0).count();
     const double gen_ms = std::chrono::duration<double, std::milli>(gen_t1 - gen_t0).count();
     const double total_ms = std::chrono::duration<double, std::milli>(synth_t1 - synth_t0).count();
     const double audio_seconds = sample_rate > 0
@@ -1272,7 +1247,6 @@ bool Pipeline::synthesize_streaming_prompt_codes_locked(const PipelineParams & p
         "[Metrics] Streaming: frames=" + std::to_string(res.n_frames) +
         ", audio_s=" + std::to_string(audio_seconds) +
         ", ref_encode=" + std::to_string(ref_encode_ms) +
-        " ms, kv_init=" + std::to_string(kv_ms) +
         " ms, stride=" + std::to_string(stream_decode_stride_frames) +
         " frames, holdback=" + std::to_string(stream_holdback_frames) +
         " frames, decode_context=" + std::to_string(codec_context_frames) +

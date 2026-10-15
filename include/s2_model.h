@@ -112,6 +112,12 @@ public:
 
     // The slot that reuse_prefix, prefill and step work on.
     void use_slot(int32_t slot) { slot_ = slot; }
+    // Empties a slot for a new sequence, keeping its prefix for reuse_prefix; the other slots go on.
+    void begin_slot(int32_t slot) { slot_ = slot; if (slot < n_seq_) n_past_[slot] = 0; }
+    // After a failed prefill: the prefix it was writing is not whole.
+    void drop_prefix(int32_t slot) { if (slot < n_seq_) kept_prefix_[slot].clear(); }
+    // Tokens a slot holds when the cache has at least n_seq slots; else 0.
+    int32_t kv_capacity(int32_t n_seq) const { return kv_buf_ && n_seq <= n_seq_ ? max_seq_len_ : 0; }
 
     // A request whose first n_prefix tokens equal those of the slot's request before (a voice's reference prompt)
     // starts after them: their keys and values are still in the cache. Returns how many tokens need no prefill.
