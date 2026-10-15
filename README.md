@@ -2,7 +2,7 @@
 
 ## About this fork
 
-A fork of [rodrigomatta/s2.cpp](https://github.com/rodrigomatta/s2.cpp) that makes generation faster and generates two requests side by side. It was tuned and measured on a GTX 1080 with 8 GB (Pascal), with CUDA. Most changes are ggml graph changes that do not depend on the card, but only CUDA on that card was measured; two build patches are for Pascal only (see Build). The engine, the model support and everything below this section are upstream's work. This fork only changes the decode loop, the codec's upsampling, the streaming pipeline and a few server details.
+A fork of [rodrigomatta/s2.cpp](https://github.com/rodrigomatta/s2.cpp) that makes generation faster and generates two requests side by side. It was tuned and measured on a GTX 1080 with 8 GB (Pascal), with CUDA. Most changes are ggml graph changes that do not depend on the card, but only CUDA on that card was measured; two build patches matter only on cards older than Ampere (see Build). The engine, the model support and everything below this section are upstream's work. This fork only changes the decode loop, the codec's upsampling, the streaming pipeline and a few server details.
 
 ### What changed
 
