@@ -16,7 +16,11 @@ A fork of [rodrigomatta/s2.cpp](https://github.com/rodrigomatta/s2.cpp) that mak
 | Slow-AR head scores only the semantic tokens and the end token (~4,100 of 155,776 rows) | 53.2 | 0.70x |
 | Shape-stable decode graphs, CUDA graphs enabled on Pascal | 52.8 | 0.71x |
 | Decode graphs and their scheduler allocation kept between steps | 50.2 | 0.74x |
-| Sampler partial-sorts only the top k | 46.4 | **0.80x** |
+| Sampler partial-sorts only the top k | 46.4 | 0.80x |
+| Pascal Q8_0 matrix-vector patch (see Build) | ~45 | |
+| Two requests side by side (batching, see below) | 47 per step, two frames | **1.4x**\* |
+
+\* Measured differently from the rows above: a streamed scene of six sentences, two asked at once (see "Two requests side by side"). One request alone is still about 0.8x.
 
 How it was measured:
 - GTX 1080 8 GB, Windows 11, CUDA 12.9, `s2-pro-q8_0.gguf`, all layers and the codec on the GPU (`--codec-follow-backend`).
