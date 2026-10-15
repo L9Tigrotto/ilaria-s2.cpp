@@ -18,45 +18,26 @@ A fork of [rodrigomatta/s2.cpp](https://github.com/rodrigomatta/s2.cpp) that mak
 | Decode graphs and their scheduler allocation kept between steps | 50.2 | 0.74x |
 | Sampler partial-sorts only the top k | 46.4 | 0.80x |
 | Pascal Q8_0 matrix-vector patch (see Build) | ~45 | |
-| Two requests side by side (batching, see below) | 47 per step, two frames | **1.4x**\* |
+| Two requests side by side (see Batching) | 47 per step, two frames | **1.4x**\* |
 
-\* Measured differently from the rows above: a streamed scene of six sentences, two asked at once (see "Two requests side by side"). One request alone is still about 0.8x.
+\\* Not the same measure as the rows above: a streamed scene of six sentences, two asked at once. One request alone stays about 0.8x.
 
-How it was measured:
-- GTX 1080 8 GB, Windows 11, CUDA 12.9, `s2-pro-q8_0.gguf`, all layers and the codec on the GPU (`--codec-follow-backend`).
-- HTTP server, warm, with a cloned voice profile.
-- 21 sentences of 2 to 6 s each.
-- Real time is seconds of audio per second of request, prefill and codec decode included.
-- A frame is 46 ms of audio, so real time needs about 46 ms per frame in all.
+Measured on a GTX 1080 8 GB, Windows 11, CUDA 12.9, `s2-pro-q8_0.gguf`, all layers and the codec on the GPU (`--codec-follow-backend`), warm HTTP server, cloned voice, 21 sentences of 2 to 6 s. Real time is seconds of audio per second of request, prefill and codec included; a frame is 46 ms of audio. Generation is now memory-bandwidth bound: Q8_0 matrix-vector products take about 40 ms of each frame.
 
-Remaining ceiling: generation is now memory-bandwidth bound. Q8_0 matrix-vector products take about 40 ms of each frame (the Fast-AR runs 10 times per frame and reads about as many bytes as the Slow-AR), so CUDA graphs gain little on this card.
+**Batching.** A second sequence in the same decode step costs little, so the KV cache has a slot per sequence (`--slots`, default 2; 1 = one request at a time) and one graph steps them all. An engine thread owns the model; a request takes a free slot between two steps. One step: 47 ms for two sequences, 45 for one. One request alone gives the same output as before (bit for bit with `--seed`); a sentence made beside another is a different take of the same voice. `--batch-text <text>` (repeatable) renders texts side by side, one WAV each.
 
-Streaming and first audio:
-- **Voice prefix KV cache.** The KV cache outlives a request. A request whose system text and reference audio match the last one's prefills only its own text: prefill drops from 420–480 ms to 70–80 ms from the second sentence on.
-- **Codec on its own thread.** In a stream, the codec decodes windows on a thread with its own CUDA backend, and skips to the newest window when it falls behind.
-- Measured on a scene of six sentences (about 25 s of speech) sent one after another, with `stream_holdback_frames` 0, `stream_decode_stride_frames` 32, `codec_decode_context_frames` 16 and `stream_start_buffer_ms` 0: first audio after about 1.5 s and no gaps on q4_k_m. On q8_0 first audio comes after about 2 s, and speech is made at about 0.86x real time, so playback needs to start about 3.3 s later to have no gaps.
+**Streaming.** The KV cache keeps the voice prefix between requests (prefill 420–480 ms to 70–80 ms per slot), and the codec decodes on its own thread. Six sentences (about 26 s of speech) with `stream_holdback_frames` 0, `stream_decode_stride_frames` 32, `codec_decode_context_frames` 16, `stream_start_buffer_ms` 0:
 
-Two requests side by side (batching):
-- Generation is bound by reading the weights, so a second sequence in the same decode step costs little. The KV cache has a slot per sequence (`--slots`, default 2; `--slots 1` runs one request at a time). The Slow-AR and Fast-AR steps run every live sequence in one graph.
-- An engine thread owns the model. Every request, from the CLI or the server, takes a free slot between two steps; the others pause for its prefill. Each slot keeps its own voice prefix.
-- On a GTX 1080 with `s2-pro-q8_0.gguf`, one step takes 47 ms for two sequences against 45 ms for one: about 1.9x the speech per second. One request alone gives the same output as before, bit for bit with a fixed `--seed`.
-- The scene above with two sentences asked at once and 0.4 s between sentences: 26 s of speech made in about 19 s (**1.4x real time** with the codec), and no gaps from about 3 s after the request, against 4.7 s one sentence at a time. Only the first sentence comes slower than real time, because it runs beside the second.
-- A sentence made beside another one is not the same take it would be alone (two columns round differently and the sampling drifts). In a listening test it still sounded like the same voice.
-- `--batch-text <text>` (repeatable) renders several texts side by side from the CLI, one WAV each; `--seed <n>` fixes the sampler.
+| q8_0 | First audio | No gaps from | Speech made |
+|---|---|---|---|
+| One sentence at a time | 1.8 s | 4.7 s | 0.86x real time |
+| Two at once | 2.0 s | 3.0 s | 1.4x real time |
 
-Server changes:
-- `GET /health` reports when the model is loaded.
-- `--cors <origin>` adds CORS headers for browser clients; there are none by default.
-- As many requests run at once as there are slots. One more waits up to 60 s for a slot instead of getting an immediate 503.
+**Server.** `GET /health` once the model is loaded; `--cors <origin>` for browser clients (none by default); as many requests at once as slots, one more waits up to 60 s instead of a 503.
 
-Build: `S2_CUDA_GRAPHS` (CMake, default ON with CUDA) turns on ggml's CUDA graphs. The patches in `patches/` are applied at build time, so the `ggml` submodule stays pinned to upstream. This fork adds three:
-- **Pascal**: allows graphs on Pascal and newer (ggml enables them only from Ampere).
-- **Node-properties comparison**: fixes needless re-captures.
-- **Pascal Q8_0 matrix-vector**: several rows per block when K <= 4096, about 6 % faster per layer on a GTX 1080 (`test-backend-ops perf`), 1 to 3 ms a frame.
+**Build.** `S2_CUDA_GRAPHS` (CMake, default ON with CUDA). Patches in `patches/` are applied at build time, `ggml` stays pinned to upstream: CUDA graphs below Ampere, a node-properties fix against needless re-captures, and a Pascal Q8_0 matrix-vector kernel (1 to 3 ms a frame).
 
-### Quantization
-
-On a GTX 1080, generation takes about 45 ms per frame with `s2-pro-q8_0.gguf` and 36 with `s2-pro-q4_k_m.gguf` (a frame is about 46 ms of speech). Both keep a cloned voice: in a blind test of six q4_k_m takes, three from this fork and three from upstream, none changed voice. In a listening test q8_0 still sounded better. A file with only the Slow-AR layers in Q4_K and everything else in Q8_0 runs at about 40 ms per frame and kept more of the expression than q4_k_m: the Fast-AR, which writes the acoustic codebooks, is where Q4 costs.
+**Quantization.** Generation per frame: q8_0 45 ms, q4_k_m 36 ms, Slow-AR in Q4_K with the rest in Q8_0 40 ms. All keep a cloned voice (blind test); q8_0 sounds best, and Q4 in the Fast-AR, which writes the acoustic codebooks, costs the most expression.
 
 ### Credits
 
