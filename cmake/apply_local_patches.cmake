@@ -14,10 +14,11 @@ if(NOT S2_PATCH_FILES)
     return()
 endif()
 
+# --ignore-whitespace: a checkout with core.autocrlf has CRLF sources (or patches); the patches are LF.
 foreach(_patch IN LISTS S2_PATCH_FILES)
 if(WIN32)
     execute_process(
-        COMMAND "${S2_PATCH_EXECUTABLE}" apply --check -p1 "${_patch}"
+        COMMAND "${S2_PATCH_EXECUTABLE}" apply --ignore-whitespace --check -p1 "${_patch}"
         WORKING_DIRECTORY "${S2_PATCH_ROOT}"
         RESULT_VARIABLE _can_apply
         OUTPUT_QUIET
@@ -36,7 +37,7 @@ endif()
     if(_can_apply EQUAL 0)
 if(WIN32)
         execute_process(
-			COMMAND "${S2_PATCH_EXECUTABLE}" apply -p1 "${_patch}"
+			COMMAND "${S2_PATCH_EXECUTABLE}" apply --ignore-whitespace -p1 "${_patch}"
             WORKING_DIRECTORY "${S2_PATCH_ROOT}"
             RESULT_VARIABLE _apply_result
         )
@@ -56,7 +57,7 @@ endif()
 
 if(WIN32)
     execute_process(
-		COMMAND "${S2_PATCH_EXECUTABLE}" apply --check --reverse -p1 "${_patch}"
+		COMMAND "${S2_PATCH_EXECUTABLE}" apply --ignore-whitespace --check --reverse -p1 "${_patch}"
         WORKING_DIRECTORY "${S2_PATCH_ROOT}"
         RESULT_VARIABLE _already_applied
         OUTPUT_QUIET
