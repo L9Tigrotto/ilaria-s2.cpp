@@ -2,7 +2,7 @@
 
 ## About this fork
 
-A fork of [rodrigomatta/s2.cpp](https://github.com/rodrigomatta/s2.cpp) that makes CUDA generation faster on older cards. It was tuned and measured on a GTX 1080 with 8 GB (Pascal). The engine, the model support and everything below this section are upstream's work. This fork only changes the decode loop, the codec's upsampling, the streaming pipeline and a few server details.
+A fork of [rodrigomatta/s2.cpp](https://github.com/rodrigomatta/s2.cpp) that makes generation faster and generates two requests side by side. It was tuned and measured on a GTX 1080 with 8 GB (Pascal), with CUDA. Most changes are ggml graph changes that do not depend on the card, but only CUDA on that card was measured; two build patches are for Pascal only (see Build). The engine, the model support and everything below this section are upstream's work. This fork only changes the decode loop, the codec's upsampling, the streaming pipeline and a few server details.
 
 ### What changed
 
@@ -32,10 +32,18 @@ Streaming and first audio:
 - **Codec on its own thread.** In a stream, the codec decodes windows on a thread with its own CUDA backend, and skips to the newest window when it falls behind.
 - Measured on a scene of six sentences (about 25 s of speech) sent one after another, with `stream_holdback_frames` 0, `stream_decode_stride_frames` 32, `codec_decode_context_frames` 16 and `stream_start_buffer_ms` 0: first audio after about 1.5 s and no gaps on q4_k_m. On q8_0 first audio comes after about 2 s, and speech is made at about 0.86x real time, so playback needs to start about 3.3 s later to have no gaps.
 
+Two requests side by side (batching):
+- Generation is bound by reading the weights, so a second sequence in the same decode step costs little. The KV cache has a slot per sequence (`--slots`, default 2; `--slots 1` runs one request at a time). The Slow-AR and Fast-AR steps run every live sequence in one graph.
+- An engine thread owns the model. Every request, from the CLI or the server, takes a free slot between two steps; the others pause for its prefill. Each slot keeps its own voice prefix.
+- On a GTX 1080 with `s2-pro-q8_0.gguf`, one step takes 47 ms for two sequences against 45 ms for one: about 1.9x the speech per second. One request alone gives the same output as before, bit for bit with a fixed `--seed`.
+- The scene above with two sentences asked at once and 0.4 s between sentences: 26 s of speech made in about 19 s (**1.4x real time** with the codec), and no gaps from about 3 s after the request, against 4.7 s one sentence at a time. Only the first sentence comes slower than real time, because it runs beside the second.
+- A sentence made beside another one is not the same take it would be alone (two columns round differently and the sampling drifts). In a listening test it still sounded like the same voice.
+- `--batch-text <text>` (repeatable) renders several texts side by side from the CLI, one WAV each; `--seed <n>` fixes the sampler.
+
 Server changes:
 - `GET /health` reports when the model is loaded.
 - `--cors <origin>` adds CORS headers for browser clients; there are none by default.
-- A request that arrives while another synthesis is running waits up to 60 s instead of getting an immediate 503.
+- As many requests run at once as there are slots. One more waits up to 60 s for a slot instead of getting an immediate 503.
 
 Build: `S2_CUDA_GRAPHS` (CMake, default ON with CUDA) turns on ggml's CUDA graphs. The patches in `patches/` are applied at build time, so the `ggml` submodule stays pinned to upstream. This fork adds three:
 - **Pascal**: allows graphs on Pascal and newer (ggml enables them only from Ampere).
