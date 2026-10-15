@@ -35,7 +35,9 @@ Measured on a GTX 1080 8 GB, Windows 11, CUDA 12.9, `s2-pro-q8_0.gguf`, all laye
 | Two at once, codec with state, stride 8 | 0.6 s | 1.8 s | 1.4x real time |
 | Two at once, codec with state, stride 4 | 0.4 s | 1.8 s | 1.4x real time |
 
-Stride 8 costs the codec what the windowed decode at stride 32 did (about 10 ms a frame beside generation); stride 4 costs more and starts no gapless playback sooner.
+Stride 8 costs the codec what the windowed decode at stride 32 did (about 10 ms a frame beside generation); stride 4 costs more and starts no gapless playback sooner. The windowed decode also made pops at its window joins (on frames 128, 256 and 384 of a sentence, where a short context cut the codec transformer's window of 128 frames); the codec with state has none.
+
+Each streamed sentence ends with a 20 ms fade-out: the model sometimes ends a sentence while the voice still sounds, and the cut from there to silence clicked. The last 20 ms of each piece wait for the next one, so the final piece can fade them.
 
 **Server.** `GET /health` once the model is loaded; `--cors <origin>` for browser clients (none by default); as many requests at once as slots, one more waits up to 60 s instead of a 503.
 
@@ -422,7 +424,8 @@ For stability, embedding lookups remain on CPU in the current CUDA hybrid path, 
 | `--trim-silence` / `--no-trim-silence` | `trim` disabled | Enable or disable trailing silence trimming on the saved WAV |
 | `--normalize` / `--no-normalize` | `normalize` disabled | Enable or disable peak normalization to `0.95` on the saved WAV |
 | `--codec-auto` / `--codec-follow-backend` / `--codec-cpu` | `--codec-auto` | `--codec-auto` benchmarks codec backends and keeps the fastest; `--codec-follow-backend` lets the codec follow the selected GPU backend; `--codec-cpu` keeps codec on CPU. If codec GPU init or allocation fails, the runtime falls back to CPU |
-| `--codec-context-frames <n>` | `auto` | Override the codec decode history window of offline decodes. Lower values use less VRAM but may reduce quality |
+| `--codec-context-frames <n>` | `auto` | Override the codec decode history window of offline decodes. Lower values use less VRAM but may reduce quality. (Fixed in this fork: on Windows a `windows.h` `max` macro read its value twice and swallowed the next flag) |
+| `--decode-codes <file>` | — | Decode codes dumped with `S2_DUMP_DIR` with the codec of `-m`, in one piece, into `-o`; with `--codec-context-frames` and `--stream-decode-stride` it repeats the old windowed stream decode instead. `S2_DUMP_DIR=<dir>` (environment) writes each streamed request's codes (`<n>.codes`: int32 codebooks, frames, then the codes codebook by codebook), what it streamed (`<n>-stream.wav`) and its text |
 | `--codec-stream-check <file>` | — | Decode a `.s2voice`'s first 160 frames whole and streamed in chunks of 1 to 32 frames, print the difference and the time, write `<output>-whole.wav` and `<output>-stream<n>.wav` |
 | `--stream-file` | — | Write the WAV through the exact streaming path instead of the final one-shot save |
 | `--stream-decode-stride N` | `0` | Decode cadence in frames. `0` = auto (`4` for server streaming, `16` for `--stream-file` and offline synthesis) |
