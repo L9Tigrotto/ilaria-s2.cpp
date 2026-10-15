@@ -18,7 +18,9 @@
 #include <cstring>
 #include <cstdio>
 #include <limits>
+#include <map>
 #include <memory>
+#include <tuple>
 #include <unordered_map>
 
 #include <new>
@@ -159,10 +161,12 @@ struct AudioCodec::Impl {
 
     codec_decode_cache decode_cache;
 
-    // Transposed-convolution weights laid out for the matrix product, made once (transposed_conv_matrix).
-    std::unordered_map<const ggml_tensor *, ggml_tensor *> tconv_matrices;
-    ggml_context * tconv_ctx = nullptr;
-    std::vector<ggml_backend_buffer_t> tconv_bufs;
+    // Tensors made once on the backend and kept for every graph: weights laid out as the graphs take them
+    // (laid_out), and the rows a convolution gathers for its columns (conv_rows).
+    std::map<std::pair<const ggml_tensor *, int>, ggml_tensor *> laid_out;
+    std::map<std::tuple<int, int, int>, ggml_tensor *> conv_rows;
+    ggml_context * const_ctx = nullptr;
+    std::vector<ggml_backend_buffer_t> const_bufs;
 };
 
 static const char * backend_type_name(BackendType backend_type) {
@@ -194,8 +198,8 @@ static void reset_decode_cache(codec_decode_cache & cache, bool preserve_failed_
 
 static void reset_codec_impl(AudioCodec::Impl & impl) {
     reset_decode_cache(impl.decode_cache, false);
-    for (ggml_backend_buffer_t b : impl.tconv_bufs) ggml_backend_buffer_free(b);
-    if (impl.tconv_ctx) ggml_free(impl.tconv_ctx);
+    for (ggml_backend_buffer_t b : impl.const_bufs) ggml_backend_buffer_free(b);
+    if (impl.const_ctx) ggml_free(impl.const_ctx);
     if (impl.model_buf) {
         ggml_backend_buffer_free(impl.model_buf);
         impl.model_buf = nullptr;
@@ -230,39 +234,122 @@ static ggml_tensor * reshape_vector_lc(ggml_context * ctx, ggml_tensor * t, int6
     return ggml_reshape_2d(ctx, cur, 1, channels);
 }
 
+// Per-channel vectors are broadcast by the operation itself: a repeat made each a full pass of its own.
 static ggml_tensor * add_channel_bias_cl(ggml_context * ctx, ggml_tensor * x, ggml_tensor * bias) {
-    return ggml_add(ctx, x, repeat_checked(ctx, reshape_vector_cl(ctx, bias, x->ne[0]), x, "repeat:bias_cl"));
+    return ggml_add(ctx, x, reshape_vector_cl(ctx, bias, x->ne[0]));
 }
 
 static ggml_tensor * add_channel_bias_lc(ggml_context * ctx, ggml_tensor * x, ggml_tensor * bias) {
-    return ggml_add(ctx, x, repeat_checked(ctx, reshape_vector_lc(ctx, bias, x->ne[1]), x, "repeat:bias_lc"));
+    return ggml_add(ctx, x, reshape_vector_lc(ctx, bias, x->ne[1]));
 }
 
 static ggml_tensor * scale_channels_cl(ggml_context * ctx, ggml_tensor * x, ggml_tensor * scale) {
-    return ggml_mul(ctx, repeat_checked(ctx, reshape_vector_cl(ctx, scale, x->ne[0]), x, "repeat:scale"), x);
+    return ggml_mul(ctx, x, reshape_vector_cl(ctx, scale, x->ne[0]));
 }
 
 static ggml_tensor * rms_norm_weighted_cl(ggml_context * ctx, ggml_tensor * x,
                                            ggml_tensor * weight, float eps) {
     ggml_tensor * cur = ggml_rms_norm(ctx, x, eps);
-    return ggml_mul(ctx, repeat_checked(ctx, reshape_vector_cl(ctx, weight, cur->ne[0]), cur, "repeat:rms"), cur);
+    return ggml_mul(ctx, cur, reshape_vector_cl(ctx, weight, cur->ne[0]));
 }
 
 static ggml_tensor * layer_norm_affine(ggml_context * ctx, ggml_tensor * x,
                                         ggml_tensor * weight, ggml_tensor * bias, float eps) {
     ggml_tensor * cur = ggml_norm(ctx, x, eps);
-    cur = ggml_mul(ctx, repeat_checked(ctx, reshape_vector_cl(ctx, weight, cur->ne[0]), cur, "repeat:ln_w"), cur);
-    cur = ggml_add(ctx, cur, repeat_checked(ctx, reshape_vector_cl(ctx, bias, cur->ne[0]), cur, "repeat:ln_b"));
-    return cur;
+    cur = ggml_mul(ctx, cur, reshape_vector_cl(ctx, weight, cur->ne[0]));
+    return ggml_add(ctx, cur, reshape_vector_cl(ctx, bias, cur->ne[0]));
 }
 
-static ggml_tensor * snake_activation(ggml_context * ctx, ggml_tensor * x, ggml_tensor * alpha) {
-    ggml_tensor * alpha_2d = reshape_vector_cl(ctx, alpha, x->ne[0]);
-    ggml_tensor * alpha_rep = repeat_checked(ctx, alpha_2d, x, "repeat:snake_alpha");
-    ggml_tensor * ax     = ggml_mul(ctx, alpha_rep, x);
+static ggml_tensor * const_tensor(AudioCodec::Impl & impl, ggml_type type, int n_dims, const int64_t * ne) {
+    if (!impl.const_ctx) {
+        ggml_init_params p = { 1024 * ggml_tensor_overhead(), nullptr, true };
+        impl.const_ctx = ggml_init(p);
+    }
+    ggml_tensor * out = ggml_new_tensor(impl.const_ctx, type, n_dims, ne);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_buffer(impl.backend, ggml_nbytes(out));
+    if (!buf) throw std::runtime_error("codec: no memory for a tensor laid out once");
+    impl.const_bufs.push_back(buf);
+    ggml_backend_tensor_alloc(buf, out, ggml_backend_buffer_get_base(buf));
+    return out;
+}
+
+enum laid_out_kind {
+    LAID_VEC,   // [n] in F32
+    LAID_INV,   // [n] in F32, one over each value
+    LAID_CONV,  // [K, c_in, c_out] as [c_in * K, c_out], c_in fastest, as conv_rows gathers the columns
+    LAID_DW,    // a depthwise convolution's [K, 1, c] as [c, K], as conv_2d_dw takes it with channels first
+    LAID_TCONV, // a transposed convolution's [K, c_out, c_in] as [c_in, c_out * K], c_out fastest
+};
+
+// A weight as the graphs take it, in F32, computed once on the codec's backend. Done in every graph, the cast and
+// the permuted copy of the transposed convolutions alone took about 8 ms of GPU a call of 8 streamed frames.
+static ggml_tensor * laid_out(AudioCodec::Impl & impl, ggml_tensor * weight, laid_out_kind kind) {
+    const auto key = std::make_pair(static_cast<const ggml_tensor *>(weight), static_cast<int>(kind));
+    auto it = impl.laid_out.find(key);
+    if (it != impl.laid_out.end()) return it->second;
+
+    ggml_init_params p = { 16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * w = (weight->type == GGML_TYPE_F32) ? weight : ggml_cast(ctx, weight, GGML_TYPE_F32);
+    const int64_t K = weight->ne[0];
+    switch (kind) {
+        case LAID_VEC:
+        case LAID_INV:   w = ggml_reshape_1d(ctx, ggml_cont(ctx, w), ggml_nelements(w)); break;
+        case LAID_CONV:  w = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, w, 1, 0, 2, 3)),
+                                             weight->ne[1] * K, weight->ne[2]); break;
+        case LAID_DW:    w = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, w, K, weight->ne[2]))); break;
+        case LAID_TCONV: w = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, w, 2, 1, 0, 3)),
+                                             weight->ne[2], weight->ne[1] * K); break;
+    }
+    ggml_tensor * out = const_tensor(impl, GGML_TYPE_F32, ggml_n_dims(w), w->ne);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx, w, out));
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(impl.backend));
+    const bool ok = allocr && ggml_gallocr_alloc_graph(allocr, gf) &&
+                    ggml_backend_graph_compute(impl.backend, gf) == GGML_STATUS_SUCCESS;
+    if (allocr) ggml_gallocr_free(allocr);
+    ggml_free(ctx);
+    if (!ok) throw std::runtime_error("codec: could not lay out a weight");
+    if (kind == LAID_INV) {
+        std::vector<float> v(static_cast<size_t>(ggml_nelements(out)));
+        ggml_backend_tensor_get(out, v.data(), 0, ggml_nbytes(out));
+        for (float & f : v) f = 1.0f / f;
+        ggml_backend_tensor_set(out, v.data(), 0, ggml_nbytes(out));
+    }
+    impl.laid_out[key] = out;
+    return out;
+}
+
+// The input positions a convolution's columns read, tap fastest: tap k of column t reads t * stride + k * dilation.
+// The same for any length, so one list per (K, dilation, stride) serves every graph as a view of its start.
+// ponytail: a longer graph than any before makes a longer list and keeps the old one (graphs point at it).
+static ggml_tensor * conv_rows(ggml_context * ctx, AudioCodec::Impl & impl, int K, int dilation, int stride,
+                               int64_t n_cols) {
+    ggml_tensor *& rows = impl.conv_rows[std::make_tuple(K, dilation, stride)];
+    if (!rows || rows->ne[0] < K * n_cols) {
+        int64_t cap = 4096;
+        while (cap < n_cols) cap *= 2;
+        std::vector<int32_t> v(static_cast<size_t>(K * cap));
+        for (int64_t t = 0; t < cap; ++t)
+            for (int k = 0; k < K; ++k) v[static_cast<size_t>(t * K + k)] = static_cast<int32_t>(t * stride + k * dilation);
+        const int64_t ne = K * cap;
+        rows = const_tensor(impl, GGML_TYPE_I32, 1, &ne);
+        ggml_backend_tensor_set(rows, v.data(), 0, v.size() * sizeof(int32_t));
+    }
+    return ggml_view_1d(ctx, rows, K * n_cols, 0);
+}
+
+// x + sin(a x)^2 / a, a per channel. Written as ggml's CUDA backend fuses it into one kernel (with the add before
+// it, the bias of a convolution or a residual sum, when nothing else reads that sum): five passes over x, and the
+// add's, were about 8 ms of GPU a call of 8 streamed frames.
+static ggml_tensor * snake_activation(ggml_context * ctx, AudioCodec::Impl & impl, ggml_tensor * x, ggml_tensor * alpha) {
+    // [channels], broadcast over the length; a reshape here would be a node of its own and part the fused ones.
+    ggml_tensor * a      = laid_out(impl, alpha, LAID_VEC);
+    ggml_tensor * inv_a  = laid_out(impl, alpha, LAID_INV);
+    ggml_tensor * ax     = ggml_mul(ctx, x, a);
     ggml_tensor * sin_ax = ggml_sin(ctx, ax);
     ggml_tensor * sin_sq = ggml_sqr(ctx, sin_ax);
-    return ggml_add(ctx, x, ggml_div(ctx, sin_sq, alpha_rep));
+    return ggml_add(ctx, x, ggml_mul(ctx, sin_sq, inv_a));
 }
 
 static int64_t extra_padding_for_conv1d(int64_t length, int kernel_size, int stride, int padding_total) {
@@ -282,11 +369,26 @@ static ggml_tensor * lc_to_cl(ggml_context * ctx, ggml_tensor * x) {
     return ggml_reshape_2d(ctx, tr, tr->ne[0], tr->ne[1]);
 }
 
-static ggml_tensor * causal_conv_1d(ggml_context * ctx,
+// Pads a [channels, length] tensor along its length, as one flat run: CUDA's pad kernel puts the second axis on a
+// grid axis capped at 65535.
+static ggml_tensor * pad_cl(ggml_context * ctx, ggml_tensor * x, int64_t left, int64_t right) {
+    if (left == 0 && right == 0) return x;
+    const int64_t C = x->ne[0];
+    ggml_tensor * flat = ggml_reshape_1d(ctx, ggml_is_contiguous(x) ? x : ggml_cont(ctx, x), ggml_nelements(x));
+    flat = ggml_pad_ext(ctx, flat, static_cast<int>(left * C), static_cast<int>(right * C), 0, 0, 0, 0, 0, 0);
+    return ggml_reshape_2d(ctx, flat, C, x->ne[1] + left + right);
+}
+
+// A causal convolution over [c_in, L], channels first throughout: the columns are gathered as whole rows of
+// channels (one get_rows, none for a kernel of 1), multiplied by the weight laid out to match, and come out as
+// [c_out, L'] with no transpose. ggml_conv_1d wanted the length first: a transpose and a pad before, an im2col
+// that read across rows and wrote F16 (cast back to F32 for the product on Pascal), and a transpose after.
+static ggml_tensor * causal_conv_1d(ggml_context * ctx, AudioCodec::Impl & impl,
                                      ggml_tensor * weight, ggml_tensor * bias,
                                      ggml_tensor * x, int stride, int dilation,
                                      stream_build * sb = nullptr) {
-    const int kernel_size = static_cast<int>((weight->ne[0] - 1) * dilation + 1);
+    const int K = static_cast<int>(weight->ne[0]);
+    const int kernel_size = (K - 1) * dilation + 1;
     int pad = kernel_size - stride;
     if (sb && pad > 0) {
         // The last inputs of the chunk before stand in for the zero padding.
@@ -295,45 +397,17 @@ static ggml_tensor * causal_conv_1d(ggml_context * ctx,
         sb->keep(ctx, ggml_view_2d(ctx, x, x->ne[0], pad, x->nb[1], (x->ne[1] - pad) * x->nb[1]), st);
         pad = 0;
     }
-    const int extra = static_cast<int>(extra_padding_for_conv1d(x->ne[1], kernel_size, stride, pad));
-    ggml_tensor * x_lc = cl_to_lc(ctx, x);
-    x_lc = ggml_pad_ext(ctx, x_lc, pad, extra, 0, 0, 0, 0, 0, 0);
-    ggml_tensor * y = ggml_conv_1d(ctx, weight, x_lc, stride, 0, dilation);
-    y = add_channel_bias_lc(ctx, y, bias);
-    return lc_to_cl(ctx, y);
-}
-
-// A transposed convolution's weight [K, c_out, c_in] as the matrix product below takes it, [c_in, K * c_out] in
-// F32, computed once on the codec's backend. Done in every graph, the cast and the permuted copy took about 8 ms
-// of GPU a call of 8 streamed frames, beside generation.
-static ggml_tensor * transposed_conv_matrix(AudioCodec::Impl & impl, ggml_tensor * weight) {
-    auto it = impl.tconv_matrices.find(weight);
-    if (it != impl.tconv_matrices.end()) return it->second;
-    const int64_t K = weight->ne[0], c_out = weight->ne[1], c_in = weight->ne[2];
-    if (!impl.tconv_ctx) {
-        ggml_init_params p = { 64 * ggml_tensor_overhead(), nullptr, true };
-        impl.tconv_ctx = ggml_init(p);
+    const int64_t extra = extra_padding_for_conv1d(x->ne[1], kernel_size, stride, pad);
+    if (x->type != GGML_TYPE_F32) x = ggml_cast(ctx, x, GGML_TYPE_F32);
+    x = pad_cl(ctx, x, pad, extra);
+    const int64_t c_in = x->ne[0], n_out = (x->ne[1] - kernel_size) / stride + 1;
+    ggml_tensor * cols = x;
+    if (K > 1 || stride > 1) {
+        cols = ggml_get_rows(ctx, x, conv_rows(ctx, impl, K, dilation, stride, n_out));
+        cols = ggml_reshape_2d(ctx, cols, c_in * K, n_out);
     }
-    ggml_tensor * out = ggml_new_tensor_2d(impl.tconv_ctx, GGML_TYPE_F32, c_in, K * c_out);
-    ggml_backend_buffer_t buf = ggml_backend_alloc_buffer(impl.backend, ggml_nbytes(out));
-    if (!buf) throw std::runtime_error("codec: no memory for a transposed convolution's weight");
-    impl.tconv_bufs.push_back(buf);
-    ggml_backend_tensor_alloc(buf, out, ggml_backend_buffer_get_base(buf));
-
-    ggml_init_params p = { 16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
-    ggml_context * ctx = ggml_init(p);
-    ggml_tensor * w = (weight->type == GGML_TYPE_F32) ? weight : ggml_cast(ctx, weight, GGML_TYPE_F32);
-    w = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, w, 1, 2, 0, 3)), c_in, K * c_out);
-    ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, w, out));
-    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(impl.backend));
-    const bool ok = allocr && ggml_gallocr_alloc_graph(allocr, gf) &&
-                    ggml_backend_graph_compute(impl.backend, gf) == GGML_STATUS_SUCCESS;
-    if (allocr) ggml_gallocr_free(allocr);
-    ggml_free(ctx);
-    if (!ok) throw std::runtime_error("codec: could not lay out a transposed convolution's weight");
-    impl.tconv_matrices[weight] = out;
-    return out;
+    ggml_tensor * y = ggml_mul_mat(ctx, laid_out(impl, weight, LAID_CONV), cols);
+    return ggml_add(ctx, y, laid_out(impl, bias, LAID_VEC));
 }
 
 static ggml_tensor * causal_conv_transpose_1d(ggml_context * ctx, AudioCodec::Impl & impl,
@@ -345,45 +419,40 @@ static ggml_tensor * causal_conv_transpose_1d(ggml_context * ctx, AudioCodec::Im
     if (sb && !(K % stride == 0 && x->ne[0] == c_in)) {
         throw std::runtime_error("codec stream: transposed convolution without the matrix product path");
     }
-    if (K % stride == 0 && x->ne[0] == c_in) {
-        // Computed as one matrix product and an overlap-add. ggml's CUDA conv_transpose_1d took about half of a
-        // decode on a GTX 1080; this is the same sum. Input position l, tap k, output channel c lands on output
-        // sample l * stride + k: the product gives every (k, c, l), and the K / stride groups of taps are summed
-        // with a shift of one block of stride samples each.
-        const int64_t L = x->ne[1], m = K / stride;
-        ggml_tensor * w = transposed_conv_matrix(impl, weight);
-        ggml_tensor * xc = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
-        if (xc->type != GGML_TYPE_F32) xc = ggml_cast(ctx, xc, GGML_TYPE_F32);
-        ggml_tensor * col = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w, xc), K, c_out, L);
-        for (int64_t j = 0; j < m; ++j) {
-            ggml_tensor * taps = ggml_view_3d(ctx, col, stride, c_out, L, col->nb[1], col->nb[2],
-                                              static_cast<size_t>(j * stride) * col->nb[0]);
-            ggml_tensor * part = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, taps, 0, 2, 1, 3)), stride * L, c_out);
-            // Padded along the first axis: CUDA's pad kernel puts the second on a grid axis capped at 65535.
-            part = ggml_pad_ext(ctx, part, static_cast<int>(j * stride), static_cast<int>((m - 1 - j) * stride), 0, 0, 0, 0, 0, 0);
-            y = y ? ggml_add(ctx, y, part) : part;
-        }
-        const int64_t tail = K - stride; // samples past its own block that each input still reaches
-        if (sb && tail > 0) {
-            // The tail the chunk before reached into this one is added at the start; this chunk's tail is kept
-            // instead of cropped.
-            ggml_tensor * st = sb->state(tail, c_out);
-            y = ggml_add(ctx, y, ggml_pad_ext(ctx, st, 0, static_cast<int>(y->ne[0] - tail), 0, 0, 0, 0, 0, 0));
-            sb->keep(ctx, ggml_view_2d(ctx, y, tail, c_out, y->nb[1], (y->ne[0] - tail) * y->nb[0]), st);
-            y = ggml_cont(ctx, ggml_view_2d(ctx, y, y->ne[0] - tail, c_out, y->nb[1], 0));
-            crop_right = 0;
-        }
-    } else {
+    if (!(K % stride == 0 && x->ne[0] == c_in)) {
         ggml_tensor * x_lc = cl_to_lc(ctx, x);
         if (x_lc->type != GGML_TYPE_F32) x_lc = ggml_cast(ctx, x_lc, GGML_TYPE_F32);
         if (weight->type != GGML_TYPE_F32) weight = ggml_cast(ctx, weight, GGML_TYPE_F32);
-        y = ggml_conv_transpose_1d(ctx, weight, x_lc, stride, 0, 1);
+        y = add_channel_bias_lc(ctx, ggml_conv_transpose_1d(ctx, weight, x_lc, stride, 0, 1), bias);
+        if (crop_right > 0) y = ggml_view_2d(ctx, y, y->ne[0] - crop_right, y->ne[1], y->nb[1], 0);
+        return lc_to_cl(ctx, y);
     }
-    y = add_channel_bias_lc(ctx, y, bias);
-    if (crop_right > 0) {
-        y = ggml_view_2d(ctx, y, y->ne[0] - crop_right, y->ne[1], y->nb[1], 0);
+    // Computed as one matrix product and an overlap-add. ggml's CUDA conv_transpose_1d took about half of a
+    // decode on a GTX 1080; this is the same sum. Input position l, tap k, output channel c lands on output
+    // sample l * stride + k: the product gives every (c, k, l), and the K / stride groups of taps are summed
+    // with a shift of one block of stride samples each. Channels first, so each group is a run of whole columns.
+    const int64_t L = x->ne[1], m = K / stride;
+    ggml_tensor * xc = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
+    if (xc->type != GGML_TYPE_F32) xc = ggml_cast(ctx, xc, GGML_TYPE_F32);
+    ggml_tensor * col = ggml_mul_mat(ctx, laid_out(impl, weight, LAID_TCONV), xc); // [c_out * K, L]
+    for (int64_t j = 0; j < m; ++j) {
+        ggml_tensor * taps = ggml_view_2d(ctx, col, c_out * stride, L, col->nb[1],
+                                          static_cast<size_t>(j * stride * c_out) * col->nb[0]);
+        ggml_tensor * part = ggml_reshape_2d(ctx, ggml_cont(ctx, taps), c_out, stride * L);
+        part = pad_cl(ctx, part, j * stride, (m - 1 - j) * stride);
+        y = y ? ggml_add(ctx, y, part) : part;
     }
-    return lc_to_cl(ctx, y);
+    const int64_t tail = K - stride; // samples past its own block that each input still reaches
+    if (sb && tail > 0) {
+        // The tail the chunk before reached into this one is added at the start; this chunk's tail is kept
+        // instead of cropped.
+        ggml_tensor * st = sb->state(c_out, tail);
+        y = ggml_add(ctx, y, pad_cl(ctx, st, 0, y->ne[1] - tail));
+        sb->keep(ctx, ggml_view_2d(ctx, y, c_out, tail, y->nb[1], (y->ne[1] - tail) * y->nb[1]), st);
+        crop_right = static_cast<int>(tail);
+    }
+    if (crop_right > 0) y = ggml_view_2d(ctx, y, c_out, y->ne[1] - crop_right, y->nb[1], 0);
+    return ggml_add(ctx, y, laid_out(impl, bias, LAID_VEC));
 }
 
 static ggml_tensor * linear_bias(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * bias,
@@ -528,26 +597,26 @@ static ggml_tensor * build_transformer(ggml_context * ctx, ggml_context * ctx_w,
     return rms_norm_weighted_cl(ctx, x, norm_w, norm_eps);
 }
 
-static ggml_tensor * build_residual_unit(ggml_context * ctx, ggml_context * ctx_w,
+static ggml_tensor * build_residual_unit(ggml_context * ctx, AudioCodec::Impl & impl,
                                           const std::string & prefix, ggml_tensor * x, int dilation,
                                           stream_build * sb = nullptr) {
     auto req = [&](const std::string & n) -> ggml_tensor * {
-        ggml_tensor * t = ggml_get_tensor(ctx_w, n.c_str());
+        ggml_tensor * t = ggml_get_tensor(impl.ctx_w, n.c_str());
         if (!t) throw std::runtime_error("missing tensor: " + n);
         return t;
     };
-    ggml_tensor * y = snake_activation(ctx, x, req(prefix + ".block.0.alpha"));
-    y = causal_conv_1d(ctx, req(prefix + ".block.1.conv.weight"), req(prefix + ".block.1.conv.bias"), y, 1, dilation, sb);
-    y = snake_activation(ctx, y, req(prefix + ".block.2.alpha"));
-    y = causal_conv_1d(ctx, req(prefix + ".block.3.conv.weight"), req(prefix + ".block.3.conv.bias"), y, 1, 1, sb);
+    ggml_tensor * y = snake_activation(ctx, impl, x, req(prefix + ".block.0.alpha"));
+    y = causal_conv_1d(ctx, impl, req(prefix + ".block.1.conv.weight"), req(prefix + ".block.1.conv.bias"), y, 1, dilation, sb);
+    y = snake_activation(ctx, impl, y, req(prefix + ".block.2.alpha"));
+    y = causal_conv_1d(ctx, impl, req(prefix + ".block.3.conv.weight"), req(prefix + ".block.3.conv.bias"), y, 1, 1, sb);
     return ggml_add(ctx, x, y);
 }
 
-static ggml_tensor * build_convnext_block(ggml_context * ctx, ggml_context * ctx_w,
+static ggml_tensor * build_convnext_block(ggml_context * ctx, AudioCodec::Impl & impl,
                                            const std::string & prefix, ggml_tensor * x,
                                            stream_build * sb = nullptr) {
     auto req = [&](const std::string & n) -> ggml_tensor * {
-        ggml_tensor * t = ggml_get_tensor(ctx_w, n.c_str());
+        ggml_tensor * t = ggml_get_tensor(impl.ctx_w, n.c_str());
         if (!t) throw std::runtime_error("missing tensor: " + n);
         return t;
     };
@@ -563,12 +632,16 @@ static ggml_tensor * build_convnext_block(ggml_context * ctx, ggml_context * ctx
         sb->keep(ctx, ggml_view_2d(ctx, x_in, x->ne[0], pad_dw, x_in->nb[1], x->ne[1] * x_in->nb[1]), st);
         pad_dw = 0;
     }
-    const int extra_dw = static_cast<int>(extra_padding_for_conv1d(x_in->ne[1], kernel_size_dw, 1, pad_dw));
-    ggml_tensor * x_lc = cl_to_lc(ctx, x_in);
-    x_lc = ggml_pad_ext(ctx, x_lc, pad_dw, extra_dw, 0, 0, 0, 0, 0, 0);
-    ggml_tensor * y_lc = ggml_conv_1d_dw(ctx, dw_w, x_lc, 1, 0, 1);
-    y_lc = add_channel_bias_lc(ctx, y_lc, dw_b);
-    ggml_tensor * y = lc_to_cl(ctx, y_lc);
+    const int64_t extra_dw = extra_padding_for_conv1d(x_in->ne[1], kernel_size_dw, 1, pad_dw);
+    x_in = pad_cl(ctx, x_in, pad_dw, extra_dw);
+    // Depthwise, straight on the channels-first layout (conv_2d_dw takes channels as its fastest axis): the
+    // im2col and batched product of ggml_conv_1d_dw took about 3 ms a call of 8 frames.
+    const int64_t C = x_in->ne[0], L = x_in->ne[1];
+    ggml_tensor * kern = ggml_permute(ctx, ggml_reshape_4d(ctx, laid_out(impl, dw_w, LAID_DW), C, kernel_size_dw, 1, 1), 3, 0, 1, 2);
+    ggml_tensor * in = ggml_permute(ctx, ggml_reshape_4d(ctx, x_in, C, L, 1, 1), 2, 0, 1, 3);
+    ggml_tensor * y = ggml_conv_2d_dw_direct(ctx, kern, in, 1, 1, 0, 0, 1, 1);
+    y = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, y, 1, 2, 0, 3)), C, y->ne[0]);
+    y = add_channel_bias_cl(ctx, y, dw_b);
 
     y = layer_norm_affine(ctx, y, req(prefix + ".norm.weight"), req(prefix + ".norm.bias"), 1e-6f);
     y = linear_bias(ctx, req(prefix + ".pwconv1.weight"), req(prefix + ".pwconv1.bias"), y, "mul_mat:cn_pw1");
@@ -587,11 +660,11 @@ static ggml_tensor * build_encoder_block(ggml_context * ctx, AudioCodec::Impl & 
         if (!t) throw std::runtime_error("missing tensor: " + n);
         return t;
     };
-    x = build_residual_unit(ctx, impl.ctx_w, prefix + ".0", x, 1);
-    x = build_residual_unit(ctx, impl.ctx_w, prefix + ".1", x, 3);
-    x = build_residual_unit(ctx, impl.ctx_w, prefix + ".2", x, 9);
-    x = snake_activation(ctx, x, req(prefix + ".3.alpha"));
-    x = causal_conv_1d(ctx, req(prefix + ".4.conv.weight"), req(prefix + ".4.conv.bias"), x, stride, 1);
+    x = build_residual_unit(ctx, impl, prefix + ".0", x, 1);
+    x = build_residual_unit(ctx, impl, prefix + ".1", x, 3);
+    x = build_residual_unit(ctx, impl, prefix + ".2", x, 9);
+    x = snake_activation(ctx, impl, x, req(prefix + ".3.alpha"));
+    x = causal_conv_1d(ctx, impl, req(prefix + ".4.conv.weight"), req(prefix + ".4.conv.bias"), x, stride, 1);
 
     if (n_transformer_layers > 0) {
         x = build_transformer(ctx, impl.ctx_w, prefix + ".5", x,
@@ -616,7 +689,7 @@ static ggml_tensor * build_quantizer_stage_up(ggml_context * ctx, AudioCodec::Im
         return t;
     };
     x = causal_conv_transpose_1d(ctx, impl, req(prefix + ".0.conv.weight"), req(prefix + ".0.conv.bias"), x, factor, 0, sb);
-    x = build_convnext_block(ctx, impl.ctx_w, prefix + ".1", x, sb);
+    x = build_convnext_block(ctx, impl, prefix + ".1", x, sb);
     return x;
 }
 
@@ -648,13 +721,13 @@ static ggml_tensor * build_decoder_block(ggml_context * ctx, AudioCodec::Impl & 
         if (!t) throw std::runtime_error("missing tensor: " + n);
         return t;
     };
-    x = snake_activation(ctx, x, req(prefix + ".block.0.alpha"));
+    x = snake_activation(ctx, impl, x, req(prefix + ".block.0.alpha"));
     x = causal_conv_transpose_1d(ctx, impl, req(prefix + ".block.1.conv.weight"),
                                        req(prefix + ".block.1.conv.bias"),
                                        x, stride, stride, sb);
-    x = build_residual_unit(ctx, impl.ctx_w, prefix + ".block.2", x, 1, sb);
-    x = build_residual_unit(ctx, impl.ctx_w, prefix + ".block.3", x, 3, sb);
-    x = build_residual_unit(ctx, impl.ctx_w, prefix + ".block.4", x, 9, sb);
+    x = build_residual_unit(ctx, impl, prefix + ".block.2", x, 1, sb);
+    x = build_residual_unit(ctx, impl, prefix + ".block.3", x, 3, sb);
+    x = build_residual_unit(ctx, impl, prefix + ".block.4", x, 9, sb);
     return x;
 }
 
@@ -666,7 +739,7 @@ static ggml_tensor * build_decoder(ggml_context * ctx, AudioCodec::Impl & impl, 
         return t;
     };
 
-    ggml_tensor * x = causal_conv_1d(ctx,
+    ggml_tensor * x = causal_conv_1d(ctx, impl,
         req(impl.tprefix + "decoder.model.0.conv.weight"),
         req(impl.tprefix + "decoder.model.0.conv.bias"),
         z, 1, 1, sb);
@@ -678,8 +751,8 @@ static ggml_tensor * build_decoder(ggml_context * ctx, AudioCodec::Impl & impl, 
     }
 
     const int last_idx = static_cast<int>(impl.decoder_rates.size()) + 1;
-    x = snake_activation(ctx, x, req(impl.tprefix + "decoder.model." + std::to_string(last_idx) + ".alpha"));
-    x = causal_conv_1d(ctx,
+    x = snake_activation(ctx, impl, x, req(impl.tprefix + "decoder.model." + std::to_string(last_idx) + ".alpha"));
+    x = causal_conv_1d(ctx, impl,
         req(impl.tprefix + "decoder.model." + std::to_string(last_idx + 1) + ".conv.weight"),
         req(impl.tprefix + "decoder.model." + std::to_string(last_idx + 1) + ".conv.bias"),
         x, 1, 1, sb);
@@ -1162,7 +1235,7 @@ bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_thread
     ggml_tensor * latent    = nullptr;
     try {
 
-        ggml_tensor * x = causal_conv_1d(ctx,
+        ggml_tensor * x = causal_conv_1d(ctx, *impl_,
             ggml_get_tensor(impl_->ctx_w, (impl_->tprefix + "encoder.block.0.conv.weight").c_str()),
             ggml_get_tensor(impl_->ctx_w, (impl_->tprefix + "encoder.block.0.conv.bias").c_str()),
             audio_in, 1, 1);
@@ -1180,8 +1253,8 @@ bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_thread
             if (!t) throw std::runtime_error("missing tensor: " + n);
             return t;
         };
-        x = snake_activation(ctx, x, req(impl_->tprefix + "encoder.block." + std::to_string(last) + ".alpha"));
-        x = causal_conv_1d(ctx,
+        x = snake_activation(ctx, *impl_, x, req(impl_->tprefix + "encoder.block." + std::to_string(last) + ".alpha"));
+        x = causal_conv_1d(ctx, *impl_,
             req(impl_->tprefix + "encoder.block." + std::to_string(last + 1) + ".conv.weight"),
             req(impl_->tprefix + "encoder.block." + std::to_string(last + 1) + ".conv.bias"),
             x, 1, 1);
@@ -1245,9 +1318,9 @@ bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_thread
             };
             for (size_t i = 0; i < impl_->quantizer_downsample_factor.size(); ++i) {
                 const std::string pfx = impl_->tprefix + "quantizer.downsample." + std::to_string(i);
-                x2 = causal_conv_1d(ctx2, req2(pfx + ".0.conv.weight"), req2(pfx + ".0.conv.bias"),
+                x2 = causal_conv_1d(ctx2, *impl_, req2(pfx + ".0.conv.weight"), req2(pfx + ".0.conv.bias"),
                                     x2, impl_->quantizer_downsample_factor[i], 1);
-                x2 = build_convnext_block(ctx2, impl_->ctx_w, pfx + ".1", x2);
+                x2 = build_convnext_block(ctx2, *impl_, pfx + ".1", x2);
             }
             x2 = build_transformer(ctx2, impl_->ctx_w, impl_->tprefix + "quantizer.pre_module", x2,
                                     impl_->rvq_transformer_block_size,
