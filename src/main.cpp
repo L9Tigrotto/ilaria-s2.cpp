@@ -12,6 +12,7 @@ namespace fs = ghc::filesystem;
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -112,6 +113,26 @@ void print_uso() {
 
 // Decodes a voice's codes once whole, then streamed in chunks of a few sizes, and prints how far apart they are.
 // Writes <output>-whole.wav and <output>-stream<n>.wav for the ears.
+// Decodes codes dumped by S2_DUMP_DIR (see s2_pipeline.cpp) in one piece, with the codec of -m on the backend asked.
+static int run_decode_codes(const s2::PipelineParams & params, const std::string & codes_path) {
+    std::ifstream in(codes_path, std::ios::binary);
+    int32_t head[2] = { 0, 0 };
+    in.read(reinterpret_cast<char *>(head), sizeof(head));
+    std::vector<int32_t> codes(static_cast<size_t>(head[0]) * head[1]);
+    in.read(reinterpret_cast<char *>(codes.data()), sizeof(int32_t) * codes.size());
+    if (!in || codes.empty()) {
+        safe_print_error("Error: cannot read codes from " + codes_path + "\n");
+        return 1;
+    }
+    s2::AudioCodec codec;
+    if (!codec.load(params.model_path, params.gpu_device, params.backend_type)) return 1;
+    std::vector<float> pcm;
+    if (!codec.decode(codes.data(), head[1], params.gen.n_threads, pcm)) return 1;
+    s2::audio_write_wav(params.output_path, pcm.data(), pcm.size(), codec.sample_rate());
+    safe_print(std::to_string(head[1]) + " frames decoded to " + params.output_path + "\n");
+    return 0;
+}
+
 static int run_codec_stream_check(const s2::PipelineParams & params, const std::string & voice_path) {
     const s2::VoiceProfile voice = s2::VoiceProfile::load(voice_path);
     // The first 160 frames: more than the codec transformer's window of 128, and a whole decode of all of them fits.
@@ -245,6 +266,7 @@ int main(int argc, char** argv) {
     bool use_stream_file = false;
     bool list_voices = false;
     std::string codec_stream_check;
+    std::string decode_codes;
     s2::ServerParams serverParams;
 
     for (int i = 1; i < argc; ++i) {
@@ -319,10 +341,15 @@ int main(int argc, char** argv) {
         }
         else if (arg == "--server")           { use_server = true; }
         else if (arg == "--codec-stream-check") { if (i+1 < argc) codec_stream_check = argv[++i]; }
+        else if (arg == "--decode-codes") { if (i+1 < argc) decode_codes = argv[++i]; }
         else if (arg == "-H" || arg == "--host") { if (i+1 < argc) serverParams.host = argv[++i]; }
         else if (arg == "-P" || arg == "--port") { if (i+1 < argc) { try { serverParams.port = std::stoi(argv[++i]); } catch(...) {} } }
         else if (arg == "--cors") { if (i+1 < argc) serverParams.cors_origin = argv[++i]; }
         else if (arg == "-h" || arg == "--help") { print_uso(); return 0; }
+    }
+
+    if (!decode_codes.empty()) {
+        return run_decode_codes(params, decode_codes);
     }
 
     if (!codec_stream_check.empty()) {

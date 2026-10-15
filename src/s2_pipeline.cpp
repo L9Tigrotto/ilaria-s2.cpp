@@ -7,6 +7,8 @@
 #include <limits>
 #include <atomic>
 #include <condition_variable>
+#include <cstdlib>
+#include <fstream>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -1067,6 +1069,10 @@ bool Pipeline::synthesize_streaming_prompt_codes_impl(const PipelineParams & par
         return false;
     }
 
+    // Debug: S2_DUMP_DIR=<dir> writes each streamed request's codes (<n>.codes: int32 codebooks, frames, then the
+    // codes codebook by codebook), what it streamed (<n>-stream.wav) and its text, for --decode-codes.
+    const char * dump_dir = std::getenv("S2_DUMP_DIR");
+    std::vector<float> dumped_pcm;
     auto decode_and_emit = [&](const std::vector<std::vector<int32_t>> & codes_by_cb, int32_t total_frames) -> bool {
         const int32_t n = total_frames - committed_frames;
         if (n <= 0) {
@@ -1101,6 +1107,7 @@ bool Pipeline::synthesize_streaming_prompt_codes_impl(const PipelineParams & par
         stream_decode_ms += std::chrono::duration<double, std::milli>(decode_t1 - decode_t0).count();
         stream_decode_batches++;
 
+        if (dump_dir) dumped_pcm.insert(dumped_pcm.end(), pcm.begin(), pcm.end());
         if (!sink.on_pcm_data(pcm.data(), pcm.size())) {
             stream_aborted = true;
             return false;
@@ -1186,6 +1193,18 @@ bool Pipeline::synthesize_streaming_prompt_codes_impl(const PipelineParams & par
     }
 
     if (stream_failed || stream_aborted) return false;
+
+    if (dump_dir) {
+        static std::atomic<int> dumps{0};
+        const std::string stem = std::string(dump_dir) + "/" + std::to_string(++dumps);
+        std::ofstream out(stem + ".codes", std::ios::binary);
+        const int32_t head[2] = { num_codebooks, res.n_frames };
+        out.write(reinterpret_cast<const char *>(head), sizeof(head));
+        for (const auto & row : accumulated_codes_by_cb)
+            out.write(reinterpret_cast<const char *>(row.data()), sizeof(int32_t) * res.n_frames);
+        audio_write_wav(stem + "-stream.wav", dumped_pcm.data(), dumped_pcm.size(), sample_rate);
+        std::ofstream(stem + ".txt") << params.text << "\n";
+    }
 
     sink.on_done();
     safe_print_ln("Streaming synthesis complete: " + std::to_string(res.n_frames) + " frames");
