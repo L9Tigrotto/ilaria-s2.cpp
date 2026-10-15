@@ -106,11 +106,15 @@ public:
     ggml_context * weights_ctx() { return weights_.ctx_w; }
     const std::unordered_set<ggml_tensor *> & weight_tensor_set() const { return weight_tensor_set_; }
 
-    // Keeps the cache (and the prefix in it) while it holds max_seq_len tokens; else allocates a new one.
-    bool init_kv_cache(int32_t max_seq_len);
+    // A slot of max_seq_len tokens for each of n_seq sequences. Keeps the cache (and the prefixes in it) while it
+    // holds that; else allocates a new one. Every slot starts empty, and slot 0 is the one in use.
+    bool init_kv_cache(int32_t max_seq_len, int32_t n_seq = 1);
 
-    // A request whose first n_prefix tokens equal those of the request before (a voice's reference prompt) starts
-    // after them: their keys and values are still in the cache. Returns how many tokens need no prefill.
+    // The slot that reuse_prefix, prefill and step work on.
+    void use_slot(int32_t slot) { slot_ = slot; }
+
+    // A request whose first n_prefix tokens equal those of the slot's request before (a voice's reference prompt)
+    // starts after them: their keys and values are still in the cache. Returns how many tokens need no prefill.
     int32_t reuse_prefix(const std::vector<int32_t> & flat_tokens, int32_t n_prefix);
 
     void reset();
@@ -136,6 +140,16 @@ public:
                      int32_t n_threads,
                      std::vector<float> & logits_out);
 
+    // step and fast_decode for several sequences at once, which costs little more than one: decoding is bound by
+    // reading the weights. step_batch: one token per sequence (num_codebooks + 1 ints each, in the order of
+    // slots), one result each. fast_decode_batch: every sequence at the same codebook position, codebook_size
+    // scores each in logits_out.
+    bool step_batch(const std::vector<int32_t> & slots, const std::vector<int32_t> & flat_tokens,
+                    int32_t n_threads, std::vector<StepResult> & results);
+    bool fast_decode_batch(const std::vector<const std::vector<float> *> & hiddens,
+                           const std::vector<const std::vector<int32_t> *> & prefix_codes,
+                           int32_t n_threads, std::vector<float> & logits_out);
+
     const ModelHParams & hparams() const { return hparams_; }
 
     // Narrows StepResult::logits to what can be sampled (see there); a negative id restores the whole vocab.
@@ -156,10 +170,16 @@ private:
     ggml_backend_buffer_t kv_buf_ = nullptr;
     ggml_tensor *  memory_k_   = nullptr;
     ggml_tensor *  memory_v_   = nullptr;
-    int32_t        max_seq_len_ = 0;
+    int32_t        max_seq_len_ = 0; // per slot; slot s holds positions s * max_seq_len_ on
+    int32_t        n_seq_      = 0;
+    int32_t        slot_       = 0;
     int32_t        n_gpu_layers_ = -1;
-    int32_t        n_past_     = 0;
-    std::vector<int32_t> kept_prefix_; // the tokens whose keys and values head the cache (see reuse_prefix)
+    std::vector<int32_t> n_past_;                   // per slot
+    std::vector<std::vector<int32_t>> kept_prefix_; // per slot: the tokens whose keys and values head it (see reuse_prefix)
+    bool step_run(int32_t slot0, int32_t n_seq, const int32_t * flat_tokens, int32_t n_threads, StepResult * results);
+    static void token_inputs(const ModelHParams & hp, const int32_t * flat_tokens, int32_t n_tokens,
+                             std::vector<int32_t> & semantic, std::vector<float> & semantic_mask,
+                             std::vector<float> & token_scale, std::vector<std::vector<int32_t>> & cb);
     size_t         ctx_size_   = 0;
     std::vector<uint8_t> ctx_buf_;
     size_t         fast_ctx_size_ = 0;
@@ -168,12 +188,15 @@ private:
 
     // The Fast-AR's keys and values within one frame, so each codebook step computes only its own
     // token; fast_cached_ is how many positions it holds (-1: unusable, take the full path).
-    bool fast_decode_one(const std::vector<float> & hidden, const std::vector<int32_t> & prefix_codes,
+    // Batched: hiddens[i] and prefix_codes[i] are sequence i's, all at the same position.
+    bool fast_decode_one(const std::vector<const std::vector<float> *> & hiddens,
+                         const std::vector<const std::vector<int32_t> *> & prefix_codes,
                          int32_t n_threads, std::vector<float> & logits_out);
     ggml_context * fast_ctx_kv_ = nullptr;
     ggml_backend_buffer_t fast_kv_buf_ = nullptr;
-    ggml_tensor *  fast_k_ = nullptr;
+    ggml_tensor *  fast_k_ = nullptr;   // num_codebooks positions for each of fast_n_seq_ sequences
     ggml_tensor *  fast_v_ = nullptr;
+    int32_t        fast_n_seq_ = 0;
     int32_t        fast_cached_ = -1;
 
     int32_t        im_end_id_ = -1;
@@ -191,7 +214,9 @@ private:
     CachedGraph slow_graph_;
     CachedGraph fast_graph_[2];                // position 0, positions after it
     ggml_backend_sched_t fast_sched0_ = nullptr; // position 0's own, so both allocations stay
-    bool build_slow_graph(int32_t n_tokens, int32_t n_kv);
+    // slot0 < 0: a prefill of n_tokens into slot_. Else a step of n_tokens sequences, one token each, in the
+    // slots from slot0 on.
+    bool build_slow_graph(int32_t n_tokens, int32_t n_kv, int32_t slot0);
     static void drop_graph(CachedGraph & g, ggml_backend_sched_t sched);
     static bool run_graph(CachedGraph & g, ggml_backend_sched_t sched,
                           const std::vector<std::pair<const void *, size_t>> & in_vals,

@@ -683,6 +683,74 @@ bool Pipeline::synthesize(const PipelineParams & params) {
     return true;
 }
 
+bool Pipeline::synthesize_batch(const PipelineParams & params) {
+    std::lock_guard<std::mutex> lock(synthesize_mutex_);
+    if (!initialized_) {
+        safe_print_error_ln("Pipeline not initialized.");
+        return false;
+    }
+    const int32_t n_seq = static_cast<int32_t>(params.batch_texts.size());
+    if (n_seq == 0) return false;
+
+    AudioData ref_audio;
+    if (!params.prompt_audio_path.empty() && !load_audio(params.prompt_audio_path, ref_audio, codec().sample_rate())) {
+        safe_print_warn_ln("Pipeline warning: load_audio failed, running without reference audio.");
+    }
+    std::vector<int32_t> ref_codes;
+    int32_t T_prompt = 0;
+    double ref_encode_ms = 0.0;
+    std::string prompt_text = params.prompt_text;
+    if (!resolve_reference_prompt_locked(params, ref_audio, ref_codes, T_prompt, prompt_text, ref_encode_ms)) {
+        return false;
+    }
+
+    CodecDecodeCacheScope codec_decode_cache_scope(codec());
+    const int32_t num_codebooks = model().hparams().num_codebooks;
+    std::vector<PromptTensor> prompts;
+    int32_t max_seq_len = 0;
+    for (const std::string & text : params.batch_texts) {
+        prompts.push_back(build_prompt(tokenizer(), text, prompt_text,
+                                       ref_codes.empty() ? nullptr : ref_codes.data(), num_codebooks, T_prompt));
+        max_seq_len = std::max(max_seq_len, prompts.back().cols + params.gen.max_new_tokens);
+    }
+    if (!model().init_kv_cache(max_seq_len, n_seq)) {
+        safe_print_error_ln("Pipeline error: init_kv_cache failed.");
+        return false;
+    }
+    std::vector<const PromptTensor *> prompt_ptrs;
+    for (const PromptTensor & p : prompts) prompt_ptrs.push_back(&p);
+
+    const auto gen_t0 = std::chrono::steady_clock::now();
+    std::vector<GenerateResult> res = generate_batch(model(), tokenizer().config(), prompt_ptrs, params.gen);
+    const auto gen_t1 = std::chrono::steady_clock::now();
+
+    // One file per text: <output>-<n>.wav.
+    const std::string stem = params.output_path.size() > 4 && params.output_path.substr(params.output_path.size() - 4) == ".wav"
+        ? params.output_path.substr(0, params.output_path.size() - 4) : params.output_path;
+    double audio_s = 0.0;
+    int32_t frames = 0;
+    for (int32_t i = 0; i < n_seq; ++i) {
+        std::vector<float> audio;
+        if (res[i].n_frames == 0 ||
+            !decode_codes_windowed(codec(), res[i].codes.data(), res[i].n_frames, num_codebooks, params.gen.n_threads,
+                                   params.stream_decode_stride_frames > 0 ? params.stream_decode_stride_frames : 16,
+                                   params.codec_decode_context_frames, audio)) {
+            safe_print_error_ln("Pipeline error: no audio for text " + std::to_string(i + 1));
+            return false;
+        }
+        const std::string path = stem + "-" + std::to_string(i + 1) + ".wav";
+        if (!save_audio(path, audio, codec().sample_rate(), false, params.normalize_output)) return false;
+        audio_s += static_cast<double>(audio.size()) / codec().sample_rate();
+        frames += res[i].n_frames;
+        safe_print_ln("Saved audio to: " + path + " (" + std::to_string(res[i].n_frames) + " frames)");
+    }
+    const double gen_ms = std::chrono::duration<double, std::milli>(gen_t1 - gen_t0).count();
+    safe_print_ln("[Metrics] Batch: sequences=" + std::to_string(n_seq) + ", frames=" + std::to_string(frames) +
+                  ", audio_s=" + std::to_string(audio_s) + ", generate=" + std::to_string(gen_ms) +
+                  " ms, gen_rtf=" + std::to_string(audio_s > 0 ? gen_ms / 1000.0 / audio_s : 0.0));
+    return true;
+}
+
 bool Pipeline::synthesize_to_memory(const PipelineParams & params, const void * ref_audio_buffer, size_t ref_audio_size, void** wav_buffer, size_t* wav_size) {
     std::vector<float> audio_out;
     AudioData ref_audio;

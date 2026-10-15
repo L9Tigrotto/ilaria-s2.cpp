@@ -46,6 +46,7 @@ struct PipelineParams {
     std::string voice_id;
     bool save_voice = false;
     std::string voice_storage_dir = "./voices";
+    std::vector<std::string> batch_texts; // synthesize_batch: generated side by side, one file each
 };
 
 class Pipeline {
@@ -57,6 +58,7 @@ public:
     bool init_from_components(Tokenizer* tokenizer, SlowARModel* model, AudioCodec* codec);
     bool is_initialized() const { return initialized_; }
     bool synthesize(const PipelineParams & params);
+    bool synthesize_batch(const PipelineParams & params);
 
     bool synthesize_to_memory(const PipelineParams & params, const void * ref_audio_buffer, size_t ref_audio_size, void** wav_buffer, size_t* wav_size);
     bool synthesize_raw(const PipelineParams & params, AudioData & ref_audio, std::vector<float> & audio_out);

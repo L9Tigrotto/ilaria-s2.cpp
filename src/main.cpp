@@ -92,6 +92,7 @@ void print_uso() {
     safe_print("  --codec-follow-backend      Force codec to follow the selected GPU backend\n");
     safe_print("  --codec-cpu                 Force codec on CPU even when model uses GPU\n");
     safe_print("  --stream-file               Write output WAV through the streaming path\n");
+    safe_print("  --batch-text       <text>   Repeatable: generate the texts side by side, <output>-<n>.wav each\n");
     safe_print("  --stream-decode-stride <n>  Decode cadence in frames (0 = auto: server 4, file/offline 16)\n");
     safe_print("  --codec-context-frames <n>  Override codec decode history (lower uses less VRAM, default: auto)\n");
     safe_print("  --log-level <level>         error, warn, info, or debug (default: info)\n");
@@ -199,6 +200,7 @@ int main(int argc, char** argv) {
         else if (arg == "--codec-follow-backend") { params.codec_auto_backend = false; params.codec_follow_backend = true; }
         else if (arg == "--codec-cpu")        { params.codec_auto_backend = false; params.codec_follow_backend = false; }
         else if (arg == "--stream-file")      { use_stream_file = true; }
+        else if (arg == "--batch-text")       { if (i+1 < argc) params.batch_texts.push_back(argv[++i]); }
         else if (arg == "--stream-decode-stride") {
             if (i+1 < argc) {
                 try { params.stream_decode_stride_frames = std::stoi(argv[++i]); } catch(...) {}
@@ -325,6 +327,14 @@ int main(int argc, char** argv) {
     if (!pipeline.init(params)) {
         safe_print_error("Pipeline initialization failed.\n");
         return 1;
+    }
+
+    if (!params.batch_texts.empty()) {
+        if (!pipeline.synthesize_batch(params)) {
+            safe_print_error("Synthesis failed.\n");
+            return 1;
+        }
+        return 0;
     }
 
     if (use_stream_file) {

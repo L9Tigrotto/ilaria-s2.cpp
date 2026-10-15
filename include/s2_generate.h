@@ -16,6 +16,7 @@ struct FrameCallbackData {
     int32_t frame_index;
     int32_t total_frames;
     int32_t num_codebooks;
+    int32_t sequence = 0; // which prompt of generate_batch
 };
 
 using FrameCallback = std::function<bool(const FrameCallbackData&)>;
@@ -42,6 +43,15 @@ GenerateResult generate(
     SlowARModel & model,
     const TokenizerConfig & config,
     const PromptTensor & prompt,
+    const GenerateParams & params
+);
+
+// Several prompts generated side by side, one result each. The model's KV cache needs a slot per prompt
+// (init_kv_cache(max_seq_len, prompts.size())); prompt i goes in slot i.
+std::vector<GenerateResult> generate_batch(
+    SlowARModel & model,
+    const TokenizerConfig & config,
+    const std::vector<const PromptTensor *> & prompts,
     const GenerateParams & params
 );
 
