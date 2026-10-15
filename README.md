@@ -26,12 +26,16 @@ Measured on a GTX 1080 8 GB, Windows 11, CUDA 12.9, `s2-pro-q8_0.gguf`, all laye
 
 **Batching.** A second sequence in the same decode step costs little, so the KV cache has a slot per sequence (`--slots`, default 2; 1 = one request at a time) and one graph steps them all. An engine thread owns the model; a request takes a free slot between two steps. One step: 47 ms for two sequences, 45 for one. One request alone gives the same output as before (bit for bit with `--seed`); a sentence made beside another is a different take of the same voice. `--batch-text <text>` (repeatable) renders texts side by side, one WAV each.
 
-**Streaming.** The KV cache keeps the voice prefix between requests (prefill 420–480 ms to 70–80 ms per slot), and the codec decodes on its own thread. Six sentences (about 26 s of speech) with `stream_holdback_frames` 0, `stream_decode_stride_frames` 32, `codec_decode_context_frames` 16, `stream_start_buffer_ms` 0:
+**Streaming.** The KV cache keeps the voice prefix between requests (prefill 420–480 ms to 70–80 ms per slot), and the codec decodes on its own thread. The codec streams with state: every layer of its decoder is causal, so each request keeps the convolutions' last inputs, the transposed convolutions' overlap and the codec transformer's keys and values (about 8.5 MB), and decodes each frame once. The chunks add up to one decode of the whole sentence (66.8 dB SNR against it, float rounding; `--codec-stream-check <file.s2voice>`), with nothing held back and no context decoded again. Six sentences (about 26 s of speech), `stream_start_buffer_ms` 0:
 
 | q8_0 | First audio | No gaps from | Speech made |
 |---|---|---|---|
-| One sentence at a time | 1.8 s | 4.7 s | 0.86x real time |
-| Two at once | 2.0 s | 3.0 s | 1.4x real time |
+| One sentence at a time, windowed codec (stride 32, context 16) | 1.8 s | 4.7 s | 0.86x real time |
+| Two at once, windowed codec (stride 32, context 16) | 1.9–2.1 s | 2.4–3.0 s | 1.4x real time |
+| Two at once, codec with state, stride 8 | 0.6 s | 1.8 s | 1.4x real time |
+| Two at once, codec with state, stride 4 | 0.4 s | 1.8 s | 1.4x real time |
+
+Stride 8 costs the codec what the windowed decode at stride 32 did (about 10 ms a frame beside generation); stride 4 costs more and starts no gapless playback sooner.
 
 **Server.** `GET /health` once the model is loaded; `--cors <origin>` for browser clients (none by default); as many requests at once as slots, one more waits up to 60 s instead of a 503.
 
@@ -225,8 +229,8 @@ All opaque objects follow an `Alloc` / `Release` pattern:
 | Field | Default | Description |
 |---|---|---|
 | `stream_decode_stride_frames` | `0` (auto) | Decode cadence in frames |
-| `stream_holdback_frames` | `-1` (auto) | Trailing frames buffered before emission |
-| `codec_decode_context_frames` | `-1` (auto) | Codec decode history window; lower uses less VRAM |
+| `stream_holdback_frames` | `-1` (auto) | Not used by streamed requests since the codec keeps state |
+| `codec_decode_context_frames` | `-1` (auto) | Codec decode history window of offline decodes; streamed requests keep state instead |
 | `low_latency` | `0` | Aggressive live preset (`stride=1`, `holdback=0`) |
 | `segment_sentences` | `0` | Sentence-by-sentence synthesis mode |
 | `sentence_pause_ms` | `180` | Silence gap between sentences |
@@ -418,7 +422,8 @@ For stability, embedding lookups remain on CPU in the current CUDA hybrid path, 
 | `--trim-silence` / `--no-trim-silence` | `trim` disabled | Enable or disable trailing silence trimming on the saved WAV |
 | `--normalize` / `--no-normalize` | `normalize` disabled | Enable or disable peak normalization to `0.95` on the saved WAV |
 | `--codec-auto` / `--codec-follow-backend` / `--codec-cpu` | `--codec-auto` | `--codec-auto` benchmarks codec backends and keeps the fastest; `--codec-follow-backend` lets the codec follow the selected GPU backend; `--codec-cpu` keeps codec on CPU. If codec GPU init or allocation fails, the runtime falls back to CPU |
-| `--codec-context-frames <n>` | `auto` | Override codec decode history window. Lower values use less VRAM but may reduce quality |
+| `--codec-context-frames <n>` | `auto` | Override the codec decode history window of offline decodes. Lower values use less VRAM but may reduce quality |
+| `--codec-stream-check <file>` | — | Decode a `.s2voice`'s first 160 frames whole and streamed in chunks of 1 to 32 frames, print the difference and the time, write `<output>-whole.wav` and `<output>-stream<n>.wav` |
 | `--stream-file` | — | Write the WAV through the exact streaming path instead of the final one-shot save |
 | `--stream-decode-stride N` | `0` | Decode cadence in frames. `0` = auto (`4` for server streaming, `16` for `--stream-file` and offline synthesis) |
 | `--log-level LEVEL` | `info` | Runtime log verbosity: `error`, `warn`, `info`, or `debug` |
@@ -461,7 +466,7 @@ Returns a finalized `audio/wav` download by default.
 - `voice=hope` reuses `./voices/hope.s2voice` by default. You can also pass `voice=voices/hope.s2voice` to target a specific file directly.
 - `params.output_format="pcm_s16le"` with `params.stream=true`: skips the WAV header entirely and returns raw PCM16 mono bytes. This is the preferred transport for a browser/app that wants to maintain a dynamic playback buffer instead of saving a file. The server includes `X-Audio-Sample-Rate`, `X-Audio-Channels`, and `X-Audio-Encoding` headers for convenience; clients should use those headers instead of assuming a fixed sample rate.
 - `params.low_latency=true`: applies an aggressive live preset for weak machines by defaulting to `stream_decode_stride_frames=1` and `stream_holdback_frames=0`, so playback can start as soon as samples exist.
-- `params.stream_holdback_frames=N`: controls how many trailing codec frames stay buffered before they are emitted. Lower values reduce startup latency; higher values keep chunk boundaries more stable. `0` is the lowest-latency option, while the default auto mode uses the codec's full history window.
+- `params.stream_holdback_frames=N`: no longer used by streamed requests: the codec keeps its state between chunks, so a chunk's samples are final as soon as they are decoded.
 - `params.stream_start_buffer_ms=N`: for chunked HTTP streaming, waits until roughly `N` milliseconds of PCM are queued before the server starts sending bytes. This is the best option when you want natural playback and can tolerate a short startup delay.
 - `params.segment_sentences=true`: switches the server from exact frame streaming to sentence-by-sentence synthesis. This is usually the best mode for slower machines because each sentence is generated as a whole, then queued for playback.
 - `params.sentence_pause_ms=N`: inserts a fixed silence gap between synthesized sentences when `segment_sentences=true`.
@@ -610,7 +615,6 @@ Voice quality and amplitude tend to degrade after ~800 tokens (~37 s of audio). 
 
 ## Known limitations (alpha)
 
-- Exact streaming still re-decodes the confirmed prefix, so streaming latency and CPU time remain structurally high until the codec becomes incremental/stateful. `stream_holdback_frames` can reduce perceived startup delay, but too-low values may add audible boundary artifacts
 - No batch inference
 - No HTTP request queue: the server accepts one active `/generate` synthesis and returns `503` for concurrent requests
 - Voice cloning quality depends heavily on reference audio length and SNR
