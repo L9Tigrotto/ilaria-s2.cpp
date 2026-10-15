@@ -615,8 +615,6 @@ Voice quality and amplitude tend to degrade after ~800 tokens (~37 s of audio). 
 
 ## Known limitations (alpha)
 
-- No batch inference
-- No HTTP request queue: the server accepts one active `/generate` synthesis and returns `503` for concurrent requests
 - Voice cloning quality depends heavily on reference audio length and SNR
 - Windows: CUDA and Vulkan backends are supported; when using MSVC 2019+, ensure CUDA ≥ 12.4 is installed before building
 - macOS is untested
