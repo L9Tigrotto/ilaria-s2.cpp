@@ -127,7 +127,29 @@ static int run_decode_codes(const s2::PipelineParams & params, const std::string
     s2::AudioCodec codec;
     if (!codec.load(params.model_path, params.gpu_device, params.backend_type)) return 1;
     std::vector<float> pcm;
-    if (!codec.decode(codes.data(), head[1], params.gen.n_threads, pcm)) return 1;
+    if (params.codec_decode_context_frames < 0) {
+        if (!codec.decode(codes.data(), head[1], params.gen.n_threads, pcm)) return 1;
+    } else {
+        // The streamed decode before the codec kept its state (holdback 0): every stride a window of the new frames
+        // and up to context frames before them, emitted from the first new frame to the window's end.
+        const int32_t T = head[1], stride = (std::max)(1, params.stream_decode_stride_frames);
+        const int32_t ctx = params.codec_decode_context_frames;
+        const size_t spf = static_cast<size_t>(codec.samples_per_code_frame());
+        std::vector<int32_t> window;
+        std::vector<float> part;
+        for (int32_t done = 0; done < T;) {
+            const int32_t end = (std::min)(T, done + stride), start = (std::max)(0, done - ctx), n = end - start;
+            window.clear();
+            for (int32_t cb = 0; cb < head[0]; ++cb) {
+                const auto row = codes.begin() + static_cast<size_t>(cb) * T;
+                window.insert(window.end(), row + start, row + end);
+            }
+            if (!codec.decode(window.data(), n, params.gen.n_threads, part)) return 1;
+            pcm.insert(pcm.end(), part.begin() + static_cast<size_t>(done - start) * spf,
+                       part.begin() + (std::min)(part.size(), static_cast<size_t>(n) * spf));
+            done = end;
+        }
+    }
     s2::audio_write_wav(params.output_path, pcm.data(), pcm.size(), codec.sample_rate());
     safe_print(std::to_string(head[1]) + " frames decoded to " + params.output_path + "\n");
     return 0;
@@ -322,11 +344,7 @@ int main(int argc, char** argv) {
         }
         else if (arg == "--codec-context-frames") {
             if (i+1 < argc) {
-#ifdef WIN32
-                try { params.codec_decode_context_frames = max(0, std::stoi(argv[++i])); } catch(...) {}
-#else
-                try { params.codec_decode_context_frames = std::max(0, std::stoi(argv[++i])); } catch(...) {}
-#endif
+                try { params.codec_decode_context_frames = (std::max)(0, std::stoi(argv[++i])); } catch(...) {}
             }
         }
         else if (arg == "--log-level") {
