@@ -1,0 +1,51 @@
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -24,6 +24,10 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
+ 
+ GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
+ 
++// Gives the streams of this backend the highest priority, so its kernels get the GPU first when another backend
++// runs beside it. Call it before the backend runs anything.
++GGML_BACKEND_API void ggml_backend_cuda_set_high_priority(ggml_backend_t backend);
++
+ // device buffer
+ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
+ 
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1371,6 +1371,7 @@ struct ggml_backend_cuda_context {
+     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
+ 
+     int curr_stream_no = 0;
++    int stream_priority = 0; // for streams not created yet: 0 is the lowest, negative is higher
+ 
+ #ifdef USE_CUDA_GRAPH
+     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
+@@ -1436,7 +1437,7 @@ struct ggml_backend_cuda_context {
+     cudaStream_t stream(int device, int stream) {
+         if (streams[device][stream] == nullptr) {
+             ggml_cuda_set_device(device);
+-            CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));
++            CUDA_CHECK(cudaStreamCreateWithPriority(&streams[device][stream], cudaStreamNonBlocking, stream_priority));
+         }
+         return streams[device][stream];
+     }
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5717,4 +5717,13 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+     return cuda_backend;
+ }
+ 
++void ggml_backend_cuda_set_high_priority(ggml_backend_t backend) {
++    GGML_ASSERT(ggml_backend_is_cuda(backend));
++    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
++    int least = 0, greatest = 0;
++    ggml_cuda_set_device(ctx->device);
++    CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
++    ctx->stream_priority = greatest;
++}
++
+ GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)

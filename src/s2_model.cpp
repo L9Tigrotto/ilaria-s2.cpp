@@ -332,6 +332,10 @@ bool SlowARModel::load_shared(gguf_context * ctx_gguf, const std::string & gguf_
                 backend_gpu_ = ggml_backend_cuda_init(static_cast<size_t>(gpu_device));
                 if (!backend_gpu_) {
                     std::cerr << "[Model] CUDA init failed for device " << gpu_device << "." << std::endl;
+                } else {
+                    // Generation first: the codec decodes on a stream of its own beside it, and its large kernels
+                    // would otherwise hold the GPU while generation waits.
+                    ggml_backend_cuda_set_high_priority(backend_gpu_);
                 }
             }
         }
