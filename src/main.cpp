@@ -111,8 +111,6 @@ void print_uso() {
     safe_print("  -h, --help                  Show this help\n");
 }
 
-// Decodes a voice's codes once whole, then streamed in chunks of a few sizes, and prints how far apart they are.
-// Writes <output>-whole.wav and <output>-stream<n>.wav for the ears.
 // Decodes codes dumped by S2_DUMP_DIR (see s2_pipeline.cpp) in one piece, with the codec of -m on the backend asked.
 static int run_decode_codes(const s2::PipelineParams & params, const std::string & codes_path) {
     std::ifstream in(codes_path, std::ios::binary);
@@ -155,6 +153,8 @@ static int run_decode_codes(const s2::PipelineParams & params, const std::string
     return 0;
 }
 
+// Decodes a voice's codes once whole, then streamed in chunks of a few sizes, and prints how far apart they are.
+// Writes <output>-whole.wav and <output>-stream<n>.wav for the ears.
 static int run_codec_stream_check(const s2::PipelineParams & params, const std::string & voice_path) {
     const s2::VoiceProfile voice = s2::VoiceProfile::load(voice_path);
     // The first 160 frames: more than the codec transformer's window of 128, and a whole decode of all of them fits.
