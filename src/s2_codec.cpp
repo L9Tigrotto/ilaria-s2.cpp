@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <limits>
 #include <memory>
+#include <unordered_map>
 
 #include <new>
 #include <stdexcept>
@@ -157,6 +158,11 @@ struct AudioCodec::Impl {
     std::vector<vq_cache> residual_vq;
 
     codec_decode_cache decode_cache;
+
+    // Transposed-convolution weights laid out for the matrix product, made once (transposed_conv_matrix).
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> tconv_matrices;
+    ggml_context * tconv_ctx = nullptr;
+    std::vector<ggml_backend_buffer_t> tconv_bufs;
 };
 
 static const char * backend_type_name(BackendType backend_type) {
@@ -188,6 +194,8 @@ static void reset_decode_cache(codec_decode_cache & cache, bool preserve_failed_
 
 static void reset_codec_impl(AudioCodec::Impl & impl) {
     reset_decode_cache(impl.decode_cache, false);
+    for (ggml_backend_buffer_t b : impl.tconv_bufs) ggml_backend_buffer_free(b);
+    if (impl.tconv_ctx) ggml_free(impl.tconv_ctx);
     if (impl.model_buf) {
         ggml_backend_buffer_free(impl.model_buf);
         impl.model_buf = nullptr;
@@ -295,11 +303,43 @@ static ggml_tensor * causal_conv_1d(ggml_context * ctx,
     return lc_to_cl(ctx, y);
 }
 
-static ggml_tensor * causal_conv_transpose_1d(ggml_context * ctx,
+// A transposed convolution's weight [K, c_out, c_in] as the matrix product below takes it, [c_in, K * c_out] in
+// F32, computed once on the codec's backend. Done in every graph, the cast and the permuted copy took about 8 ms
+// of GPU a call of 8 streamed frames, beside generation.
+static ggml_tensor * transposed_conv_matrix(AudioCodec::Impl & impl, ggml_tensor * weight) {
+    auto it = impl.tconv_matrices.find(weight);
+    if (it != impl.tconv_matrices.end()) return it->second;
+    const int64_t K = weight->ne[0], c_out = weight->ne[1], c_in = weight->ne[2];
+    if (!impl.tconv_ctx) {
+        ggml_init_params p = { 64 * ggml_tensor_overhead(), nullptr, true };
+        impl.tconv_ctx = ggml_init(p);
+    }
+    ggml_tensor * out = ggml_new_tensor_2d(impl.tconv_ctx, GGML_TYPE_F32, c_in, K * c_out);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_buffer(impl.backend, ggml_nbytes(out));
+    if (!buf) throw std::runtime_error("codec: no memory for a transposed convolution's weight");
+    impl.tconv_bufs.push_back(buf);
+    ggml_backend_tensor_alloc(buf, out, ggml_backend_buffer_get_base(buf));
+
+    ggml_init_params p = { 16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * w = (weight->type == GGML_TYPE_F32) ? weight : ggml_cast(ctx, weight, GGML_TYPE_F32);
+    w = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, w, 1, 2, 0, 3)), c_in, K * c_out);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx, w, out));
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(impl.backend));
+    const bool ok = allocr && ggml_gallocr_alloc_graph(allocr, gf) &&
+                    ggml_backend_graph_compute(impl.backend, gf) == GGML_STATUS_SUCCESS;
+    if (allocr) ggml_gallocr_free(allocr);
+    ggml_free(ctx);
+    if (!ok) throw std::runtime_error("codec: could not lay out a transposed convolution's weight");
+    impl.tconv_matrices[weight] = out;
+    return out;
+}
+
+static ggml_tensor * causal_conv_transpose_1d(ggml_context * ctx, AudioCodec::Impl & impl,
                                                ggml_tensor * weight, ggml_tensor * bias,
                                                ggml_tensor * x, int stride, int crop_right,
                                                stream_build * sb = nullptr) {
-    if (weight->type != GGML_TYPE_F32) weight = ggml_cast(ctx, weight, GGML_TYPE_F32);
     ggml_tensor * y = nullptr;
     const int64_t K = weight->ne[0], c_out = weight->ne[1], c_in = weight->ne[2];
     if (sb && !(K % stride == 0 && x->ne[0] == c_in)) {
@@ -311,7 +351,7 @@ static ggml_tensor * causal_conv_transpose_1d(ggml_context * ctx,
         // sample l * stride + k: the product gives every (k, c, l), and the K / stride groups of taps are summed
         // with a shift of one block of stride samples each.
         const int64_t L = x->ne[1], m = K / stride;
-        ggml_tensor * w = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, weight, 1, 2, 0, 3)), c_in, K * c_out);
+        ggml_tensor * w = transposed_conv_matrix(impl, weight);
         ggml_tensor * xc = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
         if (xc->type != GGML_TYPE_F32) xc = ggml_cast(ctx, xc, GGML_TYPE_F32);
         ggml_tensor * col = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w, xc), K, c_out, L);
@@ -336,6 +376,7 @@ static ggml_tensor * causal_conv_transpose_1d(ggml_context * ctx,
     } else {
         ggml_tensor * x_lc = cl_to_lc(ctx, x);
         if (x_lc->type != GGML_TYPE_F32) x_lc = ggml_cast(ctx, x_lc, GGML_TYPE_F32);
+        if (weight->type != GGML_TYPE_F32) weight = ggml_cast(ctx, weight, GGML_TYPE_F32);
         y = ggml_conv_transpose_1d(ctx, weight, x_lc, stride, 0, 1);
     }
     y = add_channel_bias_lc(ctx, y, bias);
@@ -574,7 +615,7 @@ static ggml_tensor * build_quantizer_stage_up(ggml_context * ctx, AudioCodec::Im
         if (!t) throw std::runtime_error("missing tensor: " + n);
         return t;
     };
-    x = causal_conv_transpose_1d(ctx, req(prefix + ".0.conv.weight"), req(prefix + ".0.conv.bias"), x, factor, 0, sb);
+    x = causal_conv_transpose_1d(ctx, impl, req(prefix + ".0.conv.weight"), req(prefix + ".0.conv.bias"), x, factor, 0, sb);
     x = build_convnext_block(ctx, impl.ctx_w, prefix + ".1", x, sb);
     return x;
 }
@@ -608,7 +649,7 @@ static ggml_tensor * build_decoder_block(ggml_context * ctx, AudioCodec::Impl & 
         return t;
     };
     x = snake_activation(ctx, x, req(prefix + ".block.0.alpha"));
-    x = causal_conv_transpose_1d(ctx, req(prefix + ".block.1.conv.weight"),
+    x = causal_conv_transpose_1d(ctx, impl, req(prefix + ".block.1.conv.weight"),
                                        req(prefix + ".block.1.conv.bias"),
                                        x, stride, stride, sb);
     x = build_residual_unit(ctx, impl.ctx_w, prefix + ".block.2", x, 1, sb);
