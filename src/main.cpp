@@ -93,6 +93,7 @@ void print_uso() {
     safe_print("  --codec-cpu                 Force codec on CPU even when model uses GPU\n");
     safe_print("  --stream-file               Write output WAV through the streaming path\n");
     safe_print("  --batch-text       <text>   Repeatable: generate the texts side by side, <output>-<n>.wav each\n");
+    safe_print("  --slots            <n>      Requests generated side by side (default 2; 1 = one at a time)\n");
     safe_print("  --stream-decode-stride <n>  Decode cadence in frames (0 = auto: server 4, file/offline 16)\n");
     safe_print("  --codec-context-frames <n>  Override codec decode history (lower uses less VRAM, default: auto)\n");
     safe_print("  --log-level <level>         error, warn, info, or debug (default: info)\n");
@@ -201,6 +202,7 @@ int main(int argc, char** argv) {
         else if (arg == "--codec-cpu")        { params.codec_auto_backend = false; params.codec_follow_backend = false; }
         else if (arg == "--stream-file")      { use_stream_file = true; }
         else if (arg == "--batch-text")       { if (i+1 < argc) params.batch_texts.push_back(argv[++i]); }
+        else if (arg == "--slots")            { if (i+1 < argc) { try { params.n_slots = std::stoi(argv[++i]); } catch(...) {} } }
         else if (arg == "--stream-decode-stride") {
             if (i+1 < argc) {
                 try { params.stream_decode_stride_frames = std::stoi(argv[++i]); } catch(...) {}

@@ -18,22 +18,23 @@ namespace fs = ghc::filesystem;
 
 namespace {
 
-// One synthesis at a time. A request that finds the server busy waits for it (up to a limit) instead of
-// failing at once: a client that sends its next sentence the moment a stream ends would otherwise race the
-// synthesis thread clearing the flag.
+// As many syntheses at once as the pipeline generates side by side (its slots). A request that finds them all
+// taken waits for one (up to a limit) instead of failing at once: a client that sends its next sentence the
+// moment a stream ends would otherwise race the synthesis thread giving its place back.
 struct BusyFlag {
     std::mutex m;
     std::condition_variable cv;
-    bool busy = false;
+    int free;
 
+    explicit BusyFlag(int places) : free(places) {}
     bool acquire(std::chrono::milliseconds limit) {
         std::unique_lock<std::mutex> lock(m);
-        if (!cv.wait_for(lock, limit, [&] { return !busy; })) return false;
-        busy = true;
+        if (!cv.wait_for(lock, limit, [&] { return free > 0; })) return false;
+        free--;
         return true;
     }
     void release() {
-        { std::lock_guard<std::mutex> lock(m); busy = false; }
+        { std::lock_guard<std::mutex> lock(m); free++; }
         cv.notify_one();
     }
 };
@@ -467,7 +468,7 @@ namespace s2
     bool Server::serve(const ServerParams& params)
     {
         httplib::Server svr;
-        auto server_busy = std::make_shared<BusyFlag>();
+        auto server_busy = std::make_shared<BusyFlag>(std::max(1, params.pipeline.n_slots));
 
         auto pipeline = std::make_shared<s2::Pipeline>();
         if (!pipeline->init(params.pipeline))
